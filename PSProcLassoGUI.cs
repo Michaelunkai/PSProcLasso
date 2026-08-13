@@ -200,6 +200,7 @@ namespace PSPL
         public long Mem;
         public long Priv;
         public double Gpu;
+        public bool GpuValid;
         public long Vram;
         public Dictionary<string, double> GpuEngines;
         public List<ProcRow> Members;
@@ -222,6 +223,7 @@ namespace PSPL
         public long RamTotal;
         public double AvailMB;
         public double GpuPct;
+        public bool GpuValid;
         public long VramUsed;
         public long VramTotal;
         public long Standby;
@@ -851,6 +853,27 @@ namespace PSPL
         public long FastDataTick;    // incremented whenever a CPU/RAM/process sample lands
         public long GpuDataTick;     // incremented every time a GPU pass lands
         public volatile bool GpuReady;  // true once the first GPU pass has landed
+        private volatile int _gpuPublishedMs;
+
+        public bool GpuFresh
+        {
+            get
+            {
+                int maxAge = Math.Max(2500, _gpuIntervalMs * 3);
+                return GpuOn && GpuReady &&
+                       IsTickFresh(Environment.TickCount, _gpuPublishedMs, maxAge);
+            }
+        }
+
+        public int GpuDataAgeMs
+        {
+            get
+            {
+                if (!GpuReady || _gpuPublishedMs == 0) return Int32.MaxValue;
+                int age = unchecked(Environment.TickCount - _gpuPublishedMs);
+                return age >= 0 ? age : Int32.MaxValue;
+            }
+        }
 
         private PerformanceCounter _pcCpu, _pcAvail, _pcStbyN, _pcStbyC;
         private readonly List<CounterRef> _gpuPcs = new List<CounterRef>();
@@ -1002,9 +1025,14 @@ namespace PSPL
                     _lastGpuStart = t0;
                     try
                     {
-                        SampleGpu();
+                        bool published = SampleGpu();
+                        if (!published)
+                        {
+                            if (!GpuFresh) GpuReady = false;
+                            Thread.Sleep(100);
+                            continue;
+                        }
                         GpuDataTick++;
-                        GpuReady = true;
                     }
                     catch (Exception ex) { AddError("gpu: " + ex.Message); }
                     LastGpuPassMs = Environment.TickCount - t0;
@@ -1201,6 +1229,7 @@ namespace PSPL
         {
             var s = new Snapshot();
             GpuSample gpuSample = _gpuSample;
+            bool gpuFresh = GpuFresh;
             long nowTicks = Stopwatch.GetTimestamp();
             double el = _lastSampleTicks == 0 ? 0 :
                 (nowTicks - _lastSampleTicks) * 1000.0 / Stopwatch.Frequency;
@@ -1268,10 +1297,14 @@ namespace PSPL
                     try { r.Threads = p.Threads.Count; } catch { }
                     try { r.HasVisibleWindow = p.MainWindowHandle != IntPtr.Zero; } catch { }
                     try { r.SessionId = p.SessionId; } catch { r.SessionId = -1; }
-                    double gpu; if (gpuSample.Usage.TryGetValue(r.Id, out gpu)) r.Gpu = Math.Round(gpu, 3);
-                    long vram; if (gpuSample.Memory.TryGetValue(r.Id, out vram)) r.Vram = vram;
-                    Dictionary<string, double> engines;
-                    if (gpuSample.Engines.TryGetValue(r.Id, out engines)) r.GpuEngines = engines;
+                    r.GpuValid = gpuFresh;
+                    if (gpuFresh)
+                    {
+                        double gpu; if (gpuSample.Usage.TryGetValue(r.Id, out gpu)) r.Gpu = Math.Round(gpu, 3);
+                        long vram; if (gpuSample.Memory.TryGetValue(r.Id, out vram)) r.Vram = vram;
+                        Dictionary<string, double> engines;
+                        if (gpuSample.Engines.TryGetValue(r.Id, out engines)) r.GpuEngines = engines;
+                    }
                     r.HasLimit = GpuLimits.ContainsKey(r.Id) || CpuLimits.ContainsKey(r.Id) || RamLimits.ContainsKey(r.Id);
                     var controls = new List<string>();
                     CpuLimitState cpuLimit;
@@ -1307,9 +1340,13 @@ namespace PSPL
             }
             // One immutable GPU generation supplies both rows and totals. The fast
             // sampler can never observe the old clear-then-refill intermediate state.
-            s.GpuPct = gpuSample.Total;
-            s.VramUsed = gpuSample.VramUsed;
-            s.VramTotal = gpuSample.VramTotal;
+            s.GpuValid = gpuFresh;
+            if (gpuFresh)
+            {
+                s.GpuPct = gpuSample.Total;
+                s.VramUsed = gpuSample.VramUsed;
+                s.VramTotal = gpuSample.VramTotal;
+            }
             _lastSampleTicks = nowTicks;
             Snap = s;
             Interlocked.Increment(ref FastDataTick);
@@ -1379,6 +1416,27 @@ namespace PSPL
                                       double total, long vramUsed, long vramTotal)
         {
             _gpuSample = new GpuSample(usage, memory, engines, total, vramUsed, vramTotal);
+            _gpuPublishedMs = Environment.TickCount;
+            GpuReady = true;
+        }
+
+        private static bool IsTickFresh(int now, int published, int maxAge)
+        {
+            if (published == 0 || maxAge < 0) return false;
+            int age = unchecked(now - published);
+            return age >= 0 && age <= maxAge;
+        }
+
+        internal static bool VerifyGpuFreshnessContract()
+        {
+            int now = 100000;
+            bool neverPublished = !IsTickFresh(now, 0, 2500);
+            bool fresh = IsTickFresh(now, now - 1000, 2500);
+            bool stale = !IsTickFresh(now, now - 2501, 2500);
+            int wrappedNow = Int32.MinValue + 100;
+            int wrappedPublished = Int32.MaxValue - 99;
+            bool wrapSafe = IsTickFresh(wrappedNow, wrappedPublished, 2500);
+            return neverPublished && fresh && stale && wrapSafe;
         }
 
         internal static bool VerifyPidSafeCpuDeltaContract()
@@ -1518,11 +1576,11 @@ namespace PSPL
             return failed == 0;
         }
 
-        private void SampleGpu()
+        private bool SampleGpu()
         {
-            if (!GpuOn) return;
+            if (!GpuOn) return false;
             if (!_gpuCountersInit) InitGpuCounters();
-            if (_gpuPcs.Count == 0 && _gpuMemPcs.Count == 0) return;
+            if (_gpuPcs.Count == 0 && _gpuMemPcs.Count == 0) return false;
 
             // GPU performance-counter instances are created and removed as applications
             // begin/end GPU work. Reconcile every pass so a newly active app appears in
@@ -1549,7 +1607,7 @@ namespace PSPL
                 (hadMemoryCounters && memoryReads + adapterReads == 0))
             {
                 _gpuCountersInit = false;
-                return;
+                return false;
             }
 
             double total = Math.Round(engineTotals.Count == 0 ? 0 :
@@ -1558,6 +1616,7 @@ namespace PSPL
             // Publish the complete generation in one reference write. Windows exposes
             // reliable live dedicated usage, but not a universal physical capacity.
             PublishGpuSample(gpuMap, gpuMem, enginesByPid, total, vramUsed, 0);
+            return true;
         }
 
         private static int ReadGpuEngineCounters(List<CounterRef> counters,
@@ -3656,7 +3715,7 @@ namespace PSPL
                 Snapshot snapshot = sampler.Snap;
                 if (sampler.FastDataTick >= 3 && snapshot.ProcessCount > 0 &&
                     snapshot.RamTotal > 0 &&
-                    (!needGpu || (sampler.GpuReady && sampler.GpuDataTick >= 2)))
+                    (!needGpu || (sampler.GpuFresh && sampler.GpuDataTick >= 2)))
                     return true;
             }
             return false;
@@ -4065,7 +4124,9 @@ namespace PSPL
             sb.AppendLine("PIDs       : " + String.Join(", ", MainForm.MemberRows(row)
                 .Select(r => r.Id.ToString(CultureInfo.InvariantCulture)).ToArray()));
             sb.AppendLine("CPU        : " + MainForm.FormatUsagePercent(row.Cpu) + "    Working set: " + FmtBytes(row.Mem) + "    Private: " + FmtBytes(row.Priv));
-            sb.AppendLine("GPU        : " + MainForm.FormatUsagePercent(row.Gpu) + "    VRAM: " + FmtBytes(row.Vram));
+            sb.AppendLine("GPU        : " +
+                          (row.GpuValid ? MainForm.FormatUsagePercent(row.Gpu) : "n/a") +
+                          "    VRAM: " + FmtBytes(row.Vram));
             sb.AppendLine("Priority   : " + row.Priority + "    Affinity cores: " + row.Affinity);
             sb.AppendLine("Controls   : " + (String.IsNullOrEmpty(row.Controls) ? "none" : row.Controls));
             sb.AppendLine("Threads    : " + row.Threads);
@@ -4134,7 +4195,7 @@ namespace PSPL
         private Font _listBoldFont;
         private Meter _mCpu, _mRam, _mGpu;
         private Label _lblInfo, _lblStatus, _lblSel;
-        private CheckBox _chkBalance, _chkGpu;
+        private CheckBox _chkBalance, _chkGpu, _chkGroupApps;
         private Button _btnCpu, _btnRam, _btnGpu, _btnCopy, _btnSelectAll;
         private Button _btnOptimize, _btnClearSearch;
         private TextBox _txtSearch;
@@ -4145,6 +4206,8 @@ namespace PSPL
         private enum SortKey { Cpu, Ram, Gpu, Name, Pid, Vram, Priority }
         private SortKey _sort = SortKey.Cpu;
         private bool _sortAsc;
+        private bool _groupApplications;
+        private const int VisibleRefreshIntervalMs = 1000;
         private bool _scrollToTopOnNextRefresh = true;
         private readonly Dictionary<string, ListViewItem> _byGroup =
             new Dictionary<string, ListViewItem>(StringComparer.OrdinalIgnoreCase);
@@ -4195,8 +4258,9 @@ namespace PSPL
 
             BuildUi();
             BuildTray(showTrayIcon);
-            // Keep the visible ranking synchronized with the half-second sampler.
-            _timer = new System.Windows.Forms.Timer { Interval = 500 };
+            // The sampler still collects CPU/RAM twice per second, while the visible
+            // table commits one coherent latest frame per second to avoid visual churn.
+            _timer = new System.Windows.Forms.Timer { Interval = VisibleRefreshIntervalMs };
             _timer.Tick += (s, e) =>
             {
                 _sampler.EnsureAlive();   // self-healing: never let sampling stop
@@ -4399,7 +4463,7 @@ namespace PSPL
 
         private void ApplyPreset(SortKey key, int kind)
         {
-            var rows = BuildApplicationRows(_sampler.Snap.Rows);
+            var rows = BuildVisibleRows(_sampler.Snap.Rows);
             if (rows == null || rows.Count == 0) return;
             ProcRow top = null;
             foreach (var r in rows)
@@ -4449,6 +4513,25 @@ namespace PSPL
         internal void SortForTest(int key) { _sort = (SortKey)key; _sortAsc = false; }
         internal string SortForTestGet { get { return _sort.ToString(); } }
         internal bool SortAscendingForTest { get { return _sortAsc; } }
+        internal bool GroupApplicationsForTest { get { return _groupApplications; } }
+        internal string StatusTextForTest { get { return _lblStatus == null ? "" : _lblStatus.Text; } }
+        internal bool VisibleRowsAreSinglePidForTest
+        {
+            get
+            {
+                if (_list == null || _list.Items.Count == 0) return false;
+                foreach (ListViewItem item in _list.Items)
+                {
+                    var row = item.Tag as ProcRow;
+                    if (row == null || row.Id <= 0 || row.Members == null ||
+                        row.Members.Count != 1 || row.Members[0].Id != row.Id ||
+                        String.IsNullOrEmpty(row.GroupKey) ||
+                        !row.GroupKey.StartsWith("process:", StringComparison.Ordinal))
+                        return false;
+                }
+                return true;
+            }
+        }
         internal void SetSearchForTest(string query)
         {
             _txtSearch.Text = query ?? "";
@@ -4572,22 +4655,41 @@ namespace PSPL
             _btnRam = MakeSortButton("RAM", 120, SortKey.Ram);
             _btnGpu = MakeSortButton("GPU", 188, SortKey.Gpu);
             top.Controls.Add(_btnCpu); top.Controls.Add(_btnRam); top.Controls.Add(_btnGpu);
-            _btnCopy = MakeCommandButton("COPY", 274, 102);
+            _chkGroupApps = new CheckBox
+            {
+                Text = "Group apps", Left = 266, Top = 90, Width = 100, Height = 20,
+                ForeColor = Theme.Text, BackColor = Color.Transparent,
+                Checked = false, AccessibleName = "Group related processes by application"
+            };
+            _chkGroupApps.CheckedChanged += (s, e) =>
+            {
+                _groupApplications = _chkGroupApps.Checked;
+                _byGroup.Clear();
+                _dispOrder.Clear();
+                _list.BeginUpdate();
+                try { _list.Items.Clear(); }
+                finally { _list.EndUpdate(); }
+                _scrollToTopOnNextRefresh = true;
+                RefreshList();
+            };
+            top.Controls.Add(_chkGroupApps);
+
+            _btnCopy = MakeCommandButton("COPY", 374, 82);
             _btnCopy.Click += (s, e) => CopySelectedRows();
-            _btnSelectAll = MakeCommandButton("SELECT ALL", 384, 112);
+            _btnSelectAll = MakeCommandButton("SELECT ALL", 464, 104);
             _btnSelectAll.Click += (s, e) => SelectAllRows();
-            _btnOptimize = MakeCommandButton("OPTIMIZE", 510, 96);
+            _btnOptimize = MakeCommandButton("OPTIMIZE", 576, 90);
             _btnOptimize.Click += (s, e) => RunSafeOptimizationFromUi();
 
             var searchLabel = new Label
             {
-                Text = "SEARCH", Left = 620, Top = 92, Width = 52, Height = 20,
+                Text = "SEARCH", Left = 678, Top = 92, Width = 52, Height = 20,
                 ForeColor = Theme.Dim, BackColor = Color.Transparent,
                 Font = new Font("Segoe UI", 8f, FontStyle.Bold)
             };
             _txtSearch = new TextBox
             {
-                Left = 676, Top = 88, Width = 316, Height = 24,
+                Left = 734, Top = 88, Width = 258, Height = 24,
                 BorderStyle = BorderStyle.FixedSingle,
                 BackColor = Theme.Panel, ForeColor = Theme.Text,
                 Font = new Font("Segoe UI", 9f),
@@ -4621,6 +4723,8 @@ namespace PSPL
             tips.SetToolTip(_txtSearch, "Filter by application, PID, executable path, priority or controls");
             tips.SetToolTip(_btnClearSearch, "Clear search");
             tips.SetToolTip(_btnOptimize, "Apply the reversible safe background-process profile");
+            tips.SetToolTip(_chkGroupApps,
+                "Off shows one independently measured PID per row; on combines related processes");
 
             top.Controls.Add(_btnCopy); top.Controls.Add(_btnSelectAll);
             top.Controls.Add(_btnOptimize); top.Controls.Add(searchLabel);
@@ -4991,15 +5095,19 @@ namespace PSPL
                 UpdateMeter(_mCpu, s.TotalCpu, s.TotalCpu.ToString("N1") + "%");
                 UpdateMeter(_mRam, memPct, memPct.ToString("N0") + "%  " +
                             DetailsForm.FmtBytes(s.RamUsed) + " / " + DetailsForm.FmtBytes(s.RamTotal));
-                UpdateMeter(_mGpu, s.GpuPct,
-                            _sampler.GpuReady ? s.GpuPct.ToString("N1") + "%" : "initializing…");
+                bool gpuFresh = s.GpuValid && _sampler.GpuFresh;
+                string gpuState = !_sampler.GpuOn ? "off" :
+                                  gpuFresh ? s.GpuPct.ToString("N1") + "%" :
+                                  _sampler.GpuDataTick > 0 ? "reconnecting..." : "initializing...";
+                UpdateMeter(_mGpu, gpuFresh ? s.GpuPct : 0, gpuState);
 
                 int applicationCount = BuildApplicationRows(s.Rows).Count;
                 _lblInfo.Text = "Available " + DetailsForm.FmtBytes((long)(s.AvailMB * 1024 * 1024)) +
                                 "   ·   Standby " + DetailsForm.FmtBytes(s.Standby) +
-                                "   ·   " + (_sampler.GpuReady
+                                "   ·   " + (gpuFresh
                                     ? "VRAM " + DetailsForm.FmtBytes(s.VramUsed) + (s.VramTotal > 0 ? " / " + DetailsForm.FmtBytes(s.VramTotal) : "")
-                                    : "GPU initializing…") +
+                                    : !_sampler.GpuOn ? "GPU sampling off" :
+                                      _sampler.GpuDataTick > 0 ? "GPU reconnecting..." : "GPU initializing...") +
                                 "   ·   " + s.ProcessCount + " processes in " + applicationCount +
                                 " apps   ·   " + DateTime.Now.ToString("HH:mm:ss");
 
@@ -5008,11 +5116,14 @@ namespace PSPL
 
                 var errs = _sampler.Errors;
                 string errTxt = errs.Count > 0 ? "   [!] " + string.Join("  |  ", errs) : "";
+                string viewNoun = _groupApplications ? "apps" : "processes";
                 string filterTxt = _searchTokens.Length == 0 ? "" :
                     "   Search: " + _filteredApplicationCount + "/" +
-                    _totalApplicationCount + " apps";
+                    _totalApplicationCount + " " + viewNoun;
                 _lblStatus.Text = "Sort: " + _sort +
                     (_sortAsc ? "  LOWEST FIRST ▲" : "  HIGHEST FIRST ▼") +
+                    "   View: " + (_groupApplications ? "APPLICATIONS" : "PROCESSES") +
+                    (gpuFresh ? "   GPU age " + _sampler.GpuDataAgeMs + " ms" : "") +
                     filterTxt + errTxt;
             }
             catch { }
@@ -5059,6 +5170,7 @@ namespace PSPL
                     Threads = members.Sum(r => Math.Max(0, r.Threads)),
                     Priority = CommonMemberText(members, r => r.Priority, "mixed"),
                     Affinity = CommonMemberText(members, r => r.Affinity, "mixed"),
+                    GpuValid = members.Any(r => r.GpuValid),
                     HasLimit = members.Any(r => r.HasLimit),
                     Watchdog = members.Any(r => r.Watchdog),
                     Pb = members.Any(r => r.Pb),
@@ -5089,6 +5201,63 @@ namespace PSPL
                 result.Add(row);
             }
             return result;
+        }
+
+        internal static List<ProcRow> BuildProcessRows(IEnumerable<ProcRow> source)
+        {
+            var result = new List<ProcRow>();
+            foreach (var original in source ?? Enumerable.Empty<ProcRow>())
+            {
+                if (original == null || original.Id <= 0 ||
+                    String.IsNullOrWhiteSpace(original.Name)) continue;
+                var row = new ProcRow
+                {
+                    Id = original.Id,
+                    StartTicks = original.StartTicks,
+                    Name = original.Name,
+                    ExecutablePath = original.ExecutablePath,
+                    GroupKey = "process:" + original.Id.ToString(CultureInfo.InvariantCulture) +
+                               ":" + original.StartTicks.ToString(CultureInfo.InvariantCulture),
+                    Cpu = original.Cpu,
+                    Mem = original.Mem,
+                    Priv = original.Priv,
+                    Gpu = original.Gpu,
+                    GpuValid = original.GpuValid,
+                    Vram = original.Vram,
+                    GpuEngines = original.GpuEngines,
+                    Priority = original.Priority,
+                    Affinity = original.Affinity,
+                    Threads = original.Threads,
+                    HasLimit = original.HasLimit,
+                    Controls = original.Controls,
+                    Watchdog = original.Watchdog,
+                    Pb = original.Pb,
+                    HasVisibleWindow = original.HasVisibleWindow,
+                    SessionId = original.SessionId,
+                    Members = new List<ProcRow> { original }
+                };
+                result.Add(row);
+            }
+            return result;
+        }
+
+        private List<ProcRow> BuildVisibleRows(IEnumerable<ProcRow> source)
+        {
+            return _groupApplications ? BuildApplicationRows(source) : BuildProcessRows(source);
+        }
+
+        internal static bool VerifyProcessViewContract()
+        {
+            var source = new[]
+            {
+                new ProcRow { Id = 101, StartTicks = 1001, Name = "same", Cpu = 3, Mem = 10 },
+                new ProcRow { Id = 102, StartTicks = 1002, Name = "same", Cpu = 7, Mem = 20 }
+            };
+            var rows = BuildProcessRows(source);
+            return rows.Count == 2 && rows.Select(r => r.Id).SequenceEqual(new[] { 101, 102 }) &&
+                   rows.Select(r => r.GroupKey).Distinct(StringComparer.Ordinal).Count() == 2 &&
+                   rows.All(r => MemberCount(r) == 1) &&
+                   Math.Abs(rows[1].Cpu - 7) < 0.001 && rows[1].Mem == 20;
         }
 
         private static string CommonMemberText(List<ProcRow> members,
@@ -5184,7 +5353,11 @@ namespace PSPL
             {
                 case SortKey.Cpu: c = a.Cpu.CompareTo(b.Cpu); break;
                 case SortKey.Ram: c = a.Mem.CompareTo(b.Mem); break;
-                case SortKey.Gpu: c = a.Gpu.CompareTo(b.Gpu); break;
+                case SortKey.Gpu:
+                    if (a.GpuValid != b.GpuValid)
+                        c = a.GpuValid.CompareTo(b.GpuValid);
+                    else c = a.Gpu.CompareTo(b.Gpu);
+                    break;
                 case SortKey.Name: c = String.CompareOrdinal(a.Name, b.Name); break;
                 case SortKey.Pid: c = a.Id.CompareTo(b.Id); break;
                 case SortKey.Vram: c = a.Vram.CompareTo(b.Vram); break;
@@ -5225,7 +5398,7 @@ namespace PSPL
                 foreach (ListViewItem selected in _list.SelectedItems)
                     if (selected.Tag is ProcRow) selectedIdentities.Add(RowIdentity((ProcRow)selected.Tag));
 
-                var allRows = BuildApplicationRows(snap.Rows);
+                var allRows = BuildVisibleRows(snap.Rows);
                 _totalApplicationCount = allRows.Count;
                 var rows = FilterApplicationRows(allRows, _searchTokens);
                 _filteredApplicationCount = rows.Count;
@@ -5372,7 +5545,7 @@ namespace PSPL
                    !String.Equals(it.SubItems[1].Text, r.Name, StringComparison.Ordinal) ||
                    !String.Equals(it.SubItems[2].Text, FormatUsagePercent(r.Cpu), StringComparison.Ordinal) ||
                    !String.Equals(it.SubItems[3].Text, FormatRamCell(r.Mem, ramTotal), StringComparison.Ordinal) ||
-                   !String.Equals(it.SubItems[4].Text, FormatUsagePercent(r.Gpu), StringComparison.Ordinal) ||
+                   !String.Equals(it.SubItems[4].Text, FormatGpuCell(r), StringComparison.Ordinal) ||
                    !String.Equals(it.SubItems[5].Text, DetailsForm.FmtBytes(r.Vram), StringComparison.Ordinal) ||
                    !String.Equals(it.SubItems[6].Text, r.Priority, StringComparison.Ordinal) ||
                    !String.Equals(it.SubItems[7].Text, r.Affinity, StringComparison.Ordinal);
@@ -5385,7 +5558,7 @@ namespace PSPL
             SetCell(it, 1, r.Name);
             SetCell(it, 2, FormatUsagePercent(r.Cpu));
             SetCell(it, 3, FormatRamCell(r.Mem, ramTotal));
-            SetCell(it, 4, FormatUsagePercent(r.Gpu));
+            SetCell(it, 4, FormatGpuCell(r));
             SetCell(it, 5, DetailsForm.FmtBytes(r.Vram));
             SetCell(it, 6, r.Priority);
             SetCell(it, 7, r.Affinity);
@@ -5422,7 +5595,8 @@ namespace PSPL
                     _lblSel.Text = _list.SelectedItems.Count + " apps selected (" +
                                    processCount + " processes)   CPU " +
                                    FormatUsagePercent(cpu) + "   RAM " + DetailsForm.FmtBytes(ram) +
-                                   "   GPU top " + FormatUsagePercent(gpu) + "   VRAM " +
+                                   "   GPU top " + (_sampler.Snap.GpuValid
+                                       ? FormatUsagePercent(gpu) : "--") + "   VRAM " +
                                    DetailsForm.FmtBytes(vram) + "     Ctrl+C copies an AI-ready table";
                 }
                 else if (_list.SelectedItems.Count == 1 && _list.SelectedItems[0].Tag is ProcRow)
@@ -5436,7 +5610,7 @@ namespace PSPL
                         ? MemberCount(r) + " processes"
                         : "PID " + r.Id;
                     _lblSel.Text = "▸ " + r.Name + "  " + identity + "   CPU " + FormatUsagePercent(r.Cpu) + "   RAM " +
-                                   FormatRamCell(r.Mem, _sampler.Snap.RamTotal) + "   GPU " + FormatUsagePercent(r.Gpu) + "   VRAM " +
+                                   FormatRamCell(r.Mem, _sampler.Snap.RamTotal) + "   GPU " + FormatGpuCell(r) + "   VRAM " +
                                    DetailsForm.FmtBytes(r.Vram) + (marks.Length > 0 ? "   [" + marks.Trim() + "]" : "") +
                                    "     (double-click for details, right-click for actions)";
                 }
@@ -5678,7 +5852,9 @@ namespace PSPL
                               rowRamPct.ToString("N1", CultureInfo.InvariantCulture) + "\t" +
                               DetailsForm.FmtBytes(r.Mem) + "\t" +
                               DetailsForm.FmtBytes(r.Priv) + "\t" +
-                              r.Gpu.ToString("0.###", CultureInfo.InvariantCulture) + "\t" +
+                              (r.GpuValid
+                                  ? r.Gpu.ToString("0.###", CultureInfo.InvariantCulture)
+                                  : "n/a") + "\t" +
                               DetailsForm.FmtBytes(r.Vram) + "\t" +
                               r.Priority + "\t" + r.Affinity + "\t" + managed.Trim());
             }
@@ -5918,7 +6094,10 @@ namespace PSPL
             if (row != null && !selected)
             {
                 if (col == 2) DrawCellBar(e.Graphics, e.Bounds, Math.Max(0, Math.Min(100, row.Cpu)) / 100.0, Theme.PctColor(row.Cpu));
-                else if (col == 4) DrawCellBar(e.Graphics, e.Bounds, Math.Max(0, Math.Min(100, row.Gpu)) / 100.0, Theme.PctColor(row.Gpu));
+                else if (col == 4 && row.GpuValid)
+                    DrawCellBar(e.Graphics, e.Bounds,
+                                Math.Max(0, Math.Min(100, row.Gpu)) / 100.0,
+                                Theme.PctColor(row.Gpu));
                 else if (col == 3 && _maxMem > 0) DrawCellBar(e.Graphics, e.Bounds, (double)row.Mem / _maxMem, Theme.MemColor);
                 else if (col == 5 && _maxVram > 0) DrawCellBar(e.Graphics, e.Bounds, (double)row.Vram / _maxVram, Theme.VramColor);
             }
@@ -5937,7 +6116,12 @@ namespace PSPL
                 if (col == 0) { fg = Theme.Dim; text = text.PadLeft(5); }
                 else if (col == 2) { fg = Theme.PctColor(row.Cpu); if (row.Cpu >= 80) bold = true; text = text.PadLeft(5); }
                 else if (col == 3) { if (row.Mem >= 1024L * 1024 * 1024) fg = Theme.Yellow; text = text.PadLeft(8); }
-                else if (col == 4) { fg = Theme.PctColor(row.Gpu); if (row.Gpu >= 80) bold = true; text = text.PadLeft(5); }
+                else if (col == 4)
+                {
+                    fg = row.GpuValid ? Theme.PctColor(row.Gpu) : Theme.Dim;
+                    if (row.GpuValid && row.Gpu >= 80) bold = true;
+                    text = text.PadLeft(5);
+                }
                 else if (col == 5) { if (row.Vram >= 1024L * 1024 * 1024) fg = Theme.Yellow; text = text.PadLeft(8); }
                 else if (col == 1)
                 {
@@ -5966,6 +6150,23 @@ namespace PSPL
         {
             string pct = ramTotal > 0 ? FormatUsagePercent(mem * 100.0 / ramTotal) : "--";
             return pct + "  " + DetailsForm.FmtBytes(mem);
+        }
+
+        private static string FormatGpuCell(ProcRow row)
+        {
+            return row != null && row.GpuValid ? FormatUsagePercent(row.Gpu) : "--";
+        }
+
+        internal static bool VerifyUnavailableGpuRenderingContract()
+        {
+            return FormatGpuCell(new ProcRow { Gpu = 0, GpuValid = false }) == "--" &&
+                   FormatGpuCell(new ProcRow { Gpu = 0, GpuValid = true }) == "0%" &&
+                   FormatGpuCell(new ProcRow { Gpu = 1.25, GpuValid = true }) == "1.3%";
+        }
+
+        internal static bool VerifyCalmRefreshCadenceContract()
+        {
+            return VisibleRefreshIntervalMs >= 900 && VisibleRefreshIntervalMs <= 1100;
         }
 
         internal static string FormatUsagePercent(double value)
@@ -6152,6 +6353,12 @@ namespace PSPL
             {
                 RunSelfTest();
                 Environment.ExitCode = CheckPassed("pspl-gui-selftest.txt") ? 0 : 1;
+                return;
+            }
+            if (args.Length > 0 && args[0] == "--accuracycheck")
+            {
+                RunAccuracyCheck();
+                Environment.ExitCode = CheckPassed("pspl-gui-accuracy.txt") ? 0 : 1;
                 return;
             }
             if (args.Length > 0 && args[0] == "--uicheck")
@@ -6706,6 +6913,331 @@ namespace PSPL
             }
         }
 
+        private sealed class OracleCpuPoint
+        {
+            public int Id;
+            public long StartTicks;
+            public string Name;
+            public TimeSpan Total;
+            public long SampleTicks;
+        }
+
+        private static Dictionary<int, OracleCpuPoint> CaptureOracleCpuPoints()
+        {
+            var result = new Dictionary<int, OracleCpuPoint>();
+            Process[] processes;
+            try { processes = Process.GetProcesses(); }
+            catch { return result; }
+            foreach (var process in processes)
+            {
+                try
+                {
+                    result[process.Id] = new OracleCpuPoint
+                    {
+                        Id = process.Id,
+                        StartTicks = process.StartTime.ToUniversalTime().Ticks,
+                        Name = process.ProcessName,
+                        Total = process.TotalProcessorTime,
+                        SampleTicks = Stopwatch.GetTimestamp()
+                    };
+                }
+                catch { }
+                finally { process.Dispose(); }
+            }
+            return result;
+        }
+
+        private static List<ProcRow> CaptureOracleCpuRows(int intervalMs)
+        {
+            var first = CaptureOracleCpuPoints();
+            Thread.Sleep(intervalMs);
+            var second = CaptureOracleCpuPoints();
+            int cores = Math.Max(1, Environment.ProcessorCount);
+            var rows = new List<ProcRow>();
+            foreach (var current in second.Values)
+            {
+                OracleCpuPoint previous;
+                if (!first.TryGetValue(current.Id, out previous) ||
+                    previous.StartTicks != current.StartTicks) continue;
+                double elapsedMs = (current.SampleTicks - previous.SampleTicks) *
+                                   1000.0 / Stopwatch.Frequency;
+                double deltaMs = (current.Total - previous.Total).TotalMilliseconds;
+                double cpu = elapsedMs > 0 && deltaMs > 0
+                    ? Math.Min(100, deltaMs / elapsedMs / cores * 100.0) : 0;
+                rows.Add(new ProcRow
+                {
+                    Id = current.Id,
+                    StartTicks = current.StartTicks,
+                    Name = current.Name,
+                    Cpu = cpu
+                });
+            }
+            return rows;
+        }
+
+        private static List<ProcRow> CaptureOracleRamRows()
+        {
+            var rows = new List<ProcRow>();
+            Process[] processes;
+            try { processes = Process.GetProcesses(); }
+            catch { return rows; }
+            foreach (var process in processes)
+            {
+                try
+                {
+                    rows.Add(new ProcRow
+                    {
+                        Id = process.Id,
+                        StartTicks = process.StartTime.ToUniversalTime().Ticks,
+                        Name = process.ProcessName,
+                        Mem = process.WorkingSet64
+                    });
+                }
+                catch { }
+                finally { process.Dispose(); }
+            }
+            return rows;
+        }
+
+        private static List<ProcRow> CaptureOracleGpuRows(int intervalMs)
+        {
+            var counters = new List<KeyValuePair<string, PerformanceCounter>>();
+            try
+            {
+                string[] names = new PerformanceCounterCategory("GPU Engine")
+                    .GetInstanceNames();
+                foreach (string name in names)
+                {
+                    try
+                    {
+                        var counter = new PerformanceCounter(
+                            "GPU Engine", "Utilization Percentage", name, true);
+                        counter.NextValue();
+                        counters.Add(new KeyValuePair<string, PerformanceCounter>(
+                            name, counter));
+                    }
+                    catch { }
+                }
+                if (counters.Count == 0) return new List<ProcRow>();
+                Thread.Sleep(intervalMs);
+
+                var byPid = new Dictionary<int, Dictionary<string, double>>();
+                foreach (var pair in counters)
+                {
+                    try
+                    {
+                        int pid;
+                        if (!TryParseOracleGpuPid(pair.Key, out pid)) continue;
+                        string engine = OracleGpuEngineIdentity(pair.Key);
+                        double value = Math.Max(0, pair.Value.NextValue());
+                        Dictionary<string, double> engines;
+                        if (!byPid.TryGetValue(pid, out engines))
+                        {
+                            engines = new Dictionary<string, double>(
+                                StringComparer.OrdinalIgnoreCase);
+                            byPid[pid] = engines;
+                        }
+                        double old;
+                        if (!engines.TryGetValue(engine, out old)) old = 0;
+                        engines[engine] = old + value;
+                    }
+                    catch { }
+                }
+
+                var rows = new List<ProcRow>();
+                foreach (var entry in byPid)
+                {
+                    Process process = null;
+                    try
+                    {
+                        process = Process.GetProcessById(entry.Key);
+                        rows.Add(new ProcRow
+                        {
+                            Id = process.Id,
+                            StartTicks = process.StartTime.ToUniversalTime().Ticks,
+                            Name = process.ProcessName,
+                            Gpu = Math.Min(100, entry.Value.Values.DefaultIfEmpty(0).Max()),
+                            GpuValid = true
+                        });
+                    }
+                    catch { }
+                    finally { if (process != null) process.Dispose(); }
+                }
+                return rows;
+            }
+            catch { return new List<ProcRow>(); }
+            finally
+            {
+                foreach (var pair in counters)
+                    try { pair.Value.Dispose(); } catch { }
+            }
+        }
+
+        private static bool TryParseOracleGpuPid(string instance, out int pid)
+        {
+            pid = 0;
+            int start = instance.IndexOf("pid_", StringComparison.OrdinalIgnoreCase);
+            if (start < 0) return false;
+            start += 4;
+            int end = start;
+            while (end < instance.Length && Char.IsDigit(instance[end])) end++;
+            return end > start &&
+                   Int32.TryParse(instance.Substring(start, end - start), out pid);
+        }
+
+        private static string OracleGpuEngineIdentity(string instance)
+        {
+            int start = instance.IndexOf("_luid_", StringComparison.OrdinalIgnoreCase);
+            string identity = start >= 0 ? instance.Substring(start) : instance;
+            int suffix = identity.LastIndexOf('#');
+            int duplicate;
+            if (suffix > 0 &&
+                Int32.TryParse(identity.Substring(suffix + 1), out duplicate))
+                identity = identity.Substring(0, suffix);
+            return identity;
+        }
+
+        private static bool SameProcessIdentity(ProcRow left, ProcRow right)
+        {
+            return left != null && right != null && left.Id == right.Id &&
+                   (left.StartTicks == 0 || right.StartTicks == 0 ||
+                    left.StartTicks == right.StartTicks);
+        }
+
+        private static bool TopSetAgrees(List<ProcRow> oracle, List<ProcRow> sampled,
+                                         Func<ProcRow, double> metric, int count)
+        {
+            var oracleTop = oracle.OrderByDescending(metric).Take(count).ToList();
+            var sampledTop = sampled.OrderByDescending(metric).Take(count).ToList();
+            if (oracleTop.Count == 0 || sampledTop.Count == 0 ||
+                metric(oracleTop[0]) <= 0) return false;
+            bool oracleLeaderVisible = sampledTop.Any(x =>
+                SameProcessIdentity(oracleTop[0], x));
+            bool sampledLeaderVisible = oracleTop.Any(x =>
+                SameProcessIdentity(sampledTop[0], x));
+            return oracleLeaderVisible && sampledLeaderVisible;
+        }
+
+        private static bool RamLeaderAgrees(List<ProcRow> oracle, List<ProcRow> sampled)
+        {
+            var oracleTop = oracle.OrderByDescending(r => r.Mem).FirstOrDefault();
+            var sampledTop = sampled.OrderByDescending(r => r.Mem).FirstOrDefault();
+            if (oracleTop == null || sampledTop == null) return false;
+            if (SameProcessIdentity(oracleTop, sampledTop)) return true;
+            var sampledLeaderInOracle = oracle.FirstOrDefault(r =>
+                SameProcessIdentity(r, sampledTop));
+            if (sampledLeaderInOracle == null) return false;
+            long tolerance = Math.Max(96L * 1024 * 1024,
+                                      (long)(oracleTop.Mem * 0.05));
+            return oracleTop.Mem - sampledLeaderInOracle.Mem <= tolerance;
+        }
+
+        private static string TopSummary(IEnumerable<ProcRow> rows,
+                                         Func<ProcRow, double> metric,
+                                         string suffix)
+        {
+            return String.Join(", ", rows.OrderByDescending(metric).Take(5)
+                .Select(r => r.Name + "(" + r.Id + ")=" +
+                    metric(r).ToString("N2", CultureInfo.InvariantCulture) + suffix)
+                .ToArray());
+        }
+
+        private static void RunAccuracyCheck()
+        {
+            var log = new StringBuilder();
+            Sampler sampler = null;
+            try
+            {
+                sampler = new Sampler
+                {
+                    Rules = RulesStore.Load(),
+                    ProBalance = false,
+                    EnforcementEnabled = false,
+                    AdaptiveTop20Enabled = false,
+                    GpuOn = true
+                };
+                sampler.Start();
+                var readyWait = Stopwatch.StartNew();
+                while (readyWait.ElapsedMilliseconds < 12000 &&
+                       (sampler.FastDataTick < 3 || !sampler.GpuFresh))
+                    Thread.Sleep(100);
+
+                int ramPass = 0;
+                const int ramRounds = 6;
+                for (int round = 0; round < ramRounds; round++)
+                {
+                    var oracle = CaptureOracleRamRows();
+                    var sampled = sampler.Snap.Rows;
+                    bool pass = RamLeaderAgrees(oracle, sampled);
+                    if (pass) ramPass++;
+                    log.AppendLine("RAM round " + (round + 1) + ": " +
+                        (pass ? "agree" : "DISAGREE") + " oracle=" +
+                        TopSummary(oracle, r => r.Mem / (1024.0 * 1024.0), "MB") +
+                        " sampled=" +
+                        TopSummary(sampled, r => r.Mem / (1024.0 * 1024.0), "MB"));
+                    Thread.Sleep(250);
+                }
+
+                int cpuPass = 0;
+                const int cpuRounds = 7;
+                for (int round = 0; round < cpuRounds; round++)
+                {
+                    var oracle = CaptureOracleCpuRows(650);
+                    var sampled = sampler.Snap.Rows;
+                    bool pass = TopSetAgrees(oracle, sampled, r => r.Cpu, 5);
+                    if (pass) cpuPass++;
+                    log.AppendLine("CPU round " + (round + 1) + ": " +
+                        (pass ? "agree" : "DISAGREE") + " oracle=" +
+                        TopSummary(oracle, r => r.Cpu, "%") + " sampled=" +
+                        TopSummary(sampled, r => r.Cpu, "%"));
+                }
+
+                int gpuPass = 0;
+                const int gpuRounds = 3;
+                for (int round = 0; round < gpuRounds; round++)
+                {
+                    var oracle = CaptureOracleGpuRows(1100);
+                    var sampled = sampler.Snap.Rows.Where(r => r.GpuValid).ToList();
+                    bool pass = sampler.GpuFresh &&
+                                TopSetAgrees(oracle, sampled, r => r.Gpu, 5);
+                    if (pass) gpuPass++;
+                    log.AppendLine("GPU round " + (round + 1) + ": " +
+                        (pass ? "agree" : "DISAGREE") + " oracle=" +
+                        TopSummary(oracle, r => r.Gpu, "%") + " sampled=" +
+                        TopSummary(sampled, r => r.Gpu, "%") +
+                        " age=" + sampler.GpuDataAgeMs + "ms");
+                }
+
+                bool ramOk = ramPass >= 5;
+                bool cpuOk = cpuPass >= 5;
+                bool gpuOk = gpuPass >= 2;
+                log.AppendLine("RAM agreement=" + ramPass + "/" + ramRounds);
+                log.AppendLine("CPU agreement=" + cpuPass + "/" + cpuRounds);
+                log.AppendLine("GPU agreement=" + gpuPass + "/" + gpuRounds);
+                log.AppendLine("sampler errors=" + sampler.Errors.Count);
+                foreach (string error in sampler.Errors)
+                    log.AppendLine("  - " + error);
+                log.AppendLine(ramOk && cpuOk && gpuOk && sampler.Errors.Count == 0
+                    ? "RESULT: OK - independent Windows readings confirm live CPU, RAM, and GPU leaders."
+                    : "RESULT: FAIL - independent leader agreement was below the required threshold.");
+            }
+            catch (Exception ex)
+            {
+                log.AppendLine("FATAL: " + ex);
+                log.AppendLine("RESULT: FAIL");
+            }
+            finally
+            {
+                if (sampler != null) sampler.Stop();
+                try
+                {
+                    File.WriteAllText(Path.Combine(Path.GetTempPath(),
+                                      "pspl-gui-accuracy.txt"), log.ToString());
+                }
+                catch { }
+            }
+        }
+
         private static void RunTops()
         {
             // Dumps the top-10 by CPU / RAM / GPU exactly as the sampler computes them,
@@ -6759,7 +7291,8 @@ namespace PSPL
             log.AppendLine("==============================================================");
 
             string[] checkFiles = {
-                "pspl-gui-selftest.txt", "pspl-gui-cadence.txt", "pspl-gui-startup.txt",
+                "pspl-gui-selftest.txt", "pspl-gui-accuracy.txt",
+                "pspl-gui-cadence.txt", "pspl-gui-startup.txt",
                 "pspl-gui-timing.txt", "pspl-gui-uicheck.txt",
                 "pspl-gui-enforcement.txt", "pspl-gui-background-guard.txt"
             };
@@ -6767,31 +7300,35 @@ namespace PSPL
                 try { File.Delete(Path.Combine(Path.GetTempPath(), name)); } catch { }
 
             RunSelfTest();
-            log.AppendLine("--- [1/7] sampling self-test ---");
+            log.AppendLine("--- [1/8] sampling self-test ---");
             AppendCheckOutput(log, "pspl-gui-selftest.txt");
 
+            RunAccuracyCheck();
+            log.AppendLine("--- [2/8] independent CPU/RAM/GPU accuracy comparison ---");
+            AppendCheckOutput(log, "pspl-gui-accuracy.txt");
+
             RunCadence();
-            log.AppendLine("--- [2/7] live refresh cadence (CPU/RAM ~500ms, GPU ~1s) ---");
+            log.AppendLine("--- [3/8] live sampling cadence (CPU/RAM ~500ms, GPU ~1s) ---");
             AppendCheckOutput(log, "pspl-gui-cadence.txt");
 
             RunStartup();
-            log.AppendLine("--- [3/7] startup readiness (<3s table, <5s warmed GPU under load) ---");
+            log.AppendLine("--- [4/8] startup readiness (<3s table, <5s warmed GPU under load) ---");
             AppendCheckOutput(log, "pspl-gui-startup.txt");
 
             RunTiming();
-            log.AppendLine("--- [4/7] warm-up timing ---");
+            log.AppendLine("--- [5/8] warm-up timing ---");
             AppendCheckOutput(log, "pspl-gui-timing.txt");
 
             RunUiCheck();
-            log.AppendLine("--- [5/7] UI construction + paint ---");
+            log.AppendLine("--- [6/8] UI construction + paint ---");
             AppendCheckOutput(log, "pspl-gui-uicheck.txt");
 
             RunEnforcementCheck();
-            log.AppendLine("--- [6/7] live + persistent CPU/RAM/GPU controls ---");
+            log.AppendLine("--- [7/8] live + persistent CPU/RAM/GPU controls ---");
             AppendCheckOutput(log, "pspl-gui-enforcement.txt");
 
             RunBackgroundGuardCheck();
-            log.AppendLine("--- [7/7] hidden background crash recovery ---");
+            log.AppendLine("--- [8/8] hidden background crash recovery ---");
             AppendCheckOutput(log, "pspl-gui-background-guard.txt");
 
             bool allOk = checkFiles.All(CheckPassed);
@@ -7112,7 +7649,7 @@ namespace PSPL
                 f.Opacity = 0;
                 f.Show();
                 var showWait = Stopwatch.StartNew();
-                while (showWait.ElapsedMilliseconds < 4000 && !f.SamplerForTest.GpuReady)
+                while (showWait.ElapsedMilliseconds < 4000 && !f.SamplerForTest.GpuFresh)
                 {
                     Application.DoEvents();
                     Thread.Sleep(50);
@@ -7156,7 +7693,7 @@ namespace PSPL
                 bool sortButtonsOk = !f.SortAscendingForTest && f.SortForTestGet == "Gpu" && topVisible;
 
                 int fullRowCount = f.VisibleRowCountForTest;
-                bool liveSearch = false;
+                bool liveSearch = false, searchUsesProcessNoun = false;
                 int filteredRowCount = -1;
                 if (fullRowCount > 0)
                 {
@@ -7164,20 +7701,40 @@ namespace PSPL
                     if (!String.IsNullOrWhiteSpace(query))
                     {
                         f.SetSearchForTest(query);
+                        f.RefreshAllForTest();
                         Application.DoEvents();
                         filteredRowCount = f.VisibleRowCountForTest;
                         liveSearch = filteredRowCount == 1 &&
                                      f.SearchTextForTest == query;
+                        searchUsesProcessNoun =
+                            f.StatusTextForTest.Contains("Search: 1/") &&
+                            f.StatusTextForTest.Contains(" processes") &&
+                            !f.StatusTextForTest.Contains(" apps");
                         f.SetSearchForTest("");
+                        f.RefreshAllForTest();
                         Application.DoEvents();
                         liveSearch = liveSearch && f.SearchTextForTest.Length == 0 &&
                                      f.VisibleRowCountForTest > filteredRowCount;
                     }
                 }
                 log.AppendLine("instant search: liveNamePidFilter=" + liveSearch +
+                               " processNoun=" + searchUsesProcessNoun +
                                " fullRows=" + fullRowCount +
                                " filteredRows=" + filteredRowCount +
                                " restoredRows=" + f.VisibleRowCountForTest);
+                bool defaultProcessView = !f.GroupApplicationsForTest &&
+                                          f.VisibleRowsAreSinglePidForTest &&
+                                          f.StatusTextForTest.Contains("View: PROCESSES") &&
+                                          searchUsesProcessNoun;
+                bool processViewContract = MainForm.VerifyProcessViewContract();
+                bool unavailableGpuRendering =
+                    MainForm.VerifyUnavailableGpuRenderingContract();
+                bool calmRefreshCadence =
+                    MainForm.VerifyCalmRefreshCadenceContract();
+                log.AppendLine("default process view: enabled=" + defaultProcessView +
+                               " onePidContract=" + processViewContract +
+                               " unavailableGpuMarker=" + unavailableGpuRendering +
+                               " calmOneSecondPaint=" + calmRefreshCadence);
 
                 // Bulk-copy contract: users must be able to select several processes,
                 // keep that selection through live refreshes, and copy a structured
@@ -7310,12 +7867,14 @@ namespace PSPL
                 }
                 catch (Exception ex) { log.AppendLine("PAINT FAILED: " + ex.Message); }
                 f.ShutdownForTest();
-                log.AppendLine(applicationGrouping && embeddedIcon && startupMenuAccurate &&
+                log.AppendLine(applicationGrouping && defaultProcessView &&
+                               processViewContract && unavailableGpuRendering &&
+                               calmRefreshCadence && embeddedIcon && startupMenuAccurate &&
                                liveSearch &&
                                sortButtonsOk && bulkCopyOk &&
                                calmAccurateList && allMetricTops && paintOk
-                    ? "RESULT: OK - searchable grouped calm GUI, embedded icon, click-drag selection, ranking, and AI copy."
-                    : "RESULT: FAIL - search, grouping, icon, drag selection, accuracy, calmness, ranking, or AI copy failed.");
+                    ? "RESULT: OK - trustworthy one-PID ranking, optional grouping, calm repaint, and honest GPU availability."
+                    : "RESULT: FAIL - process view, search, grouping, icon, selection, ranking, calmness, or GPU availability failed.");
             }
             catch (Exception ex)
             {
@@ -7363,6 +7922,7 @@ namespace PSPL
                 bool cpuReadFailureRecovery = Sampler.VerifyCpuReadFailureRecoveryContract();
                 bool gpuCounterFailureIsolation = Sampler.VerifyGpuCounterFailureIsolationContract();
                 bool gpuWarmupSafety = Sampler.VerifyGpuWarmupContract();
+                bool gpuFreshnessSafety = Sampler.VerifyGpuFreshnessContract();
                 bool processIdentitySafety = Sampler.VerifyProcessIdentitySafetyContract();
                 bool nativeStatusSafety = Sampler.VerifyNativeStatusSafetyContract();
                 bool resourceReleaseSafety = Sampler.VerifyResourceReleaseSafetyContract();
@@ -7372,6 +7932,11 @@ namespace PSPL
                 bool backupRuleSafety = RulesStore.VerifyBackupRecoveryContract();
                 bool recoveryBudgetSafety = VerifyBackgroundRecoveryBudgetContract();
                 bool searchFilterSafety = MainForm.VerifySearchFilterContract();
+                bool processViewSafety = MainForm.VerifyProcessViewContract();
+                bool unavailableGpuRenderingSafety =
+                    MainForm.VerifyUnavailableGpuRenderingContract();
+                bool calmRefreshCadenceSafety =
+                    MainForm.VerifyCalmRefreshCadenceContract();
                 bool optimizerPolicySafety = SafeOptimizer.VerifyPolicyContract();
                 bool adaptiveTop20Safety = SafeOptimizer.VerifyAdaptiveTop20Contract();
                 bool aiAutomationSafety = AiAutomation.VerifyJsonContract();
@@ -7382,6 +7947,7 @@ namespace PSPL
                 log.AppendLine("CPU read failure recovery=" + cpuReadFailureRecovery);
                 log.AppendLine("GPU counter failure isolation=" + gpuCounterFailureIsolation);
                 log.AppendLine("GPU counter warm-up safety=" + gpuWarmupSafety);
+                log.AppendLine("GPU publication freshness=" + gpuFreshnessSafety);
                 log.AppendLine("process identity safety=" + processIdentitySafety);
                 log.AppendLine("native suspend/resume status safety=" + nativeStatusSafety);
                 log.AppendLine("resource release safety=" + resourceReleaseSafety);
@@ -7391,6 +7957,11 @@ namespace PSPL
                 log.AppendLine("rules backup recovery safety=" + backupRuleSafety);
                 log.AppendLine("background recovery budget safety=" + recoveryBudgetSafety);
                 log.AppendLine("instant search filter safety=" + searchFilterSafety);
+                log.AppendLine("one-PID process view safety=" + processViewSafety);
+                log.AppendLine("unavailable GPU rendering safety=" +
+                               unavailableGpuRenderingSafety);
+                log.AppendLine("calm visible refresh cadence=" +
+                               calmRefreshCadenceSafety);
                 log.AppendLine("safe optimizer policy=" + optimizerPolicySafety);
                 log.AppendLine("adaptive top-20 performance policy=" + adaptiveTop20Safety);
                 log.AppendLine("AI automation JSON contract=" + aiAutomationSafety);
@@ -7409,7 +7980,7 @@ namespace PSPL
                     var s = sam.Snap;
                     bool cpuReady = sam.FastDataTick >= 3;
                     bool ramReady = s.RamTotal > 0 && s.AvailMB > 0 && s.RamUsed > 0;
-                    bool gpuReady = sam.GpuReady && sam.GpuDataTick >= 2;
+                    bool gpuReady = sam.GpuFresh && sam.GpuDataTick >= 2;
                     bool gpuRowsReady = s.GpuPct <= 0 || s.Rows.Any(r => r.Gpu > 0);
                     if (!cpuReady || !ramReady || !gpuReady || !gpuRowsReady || s.ProcessCount == 0) continue;
 
@@ -7434,12 +8005,12 @@ namespace PSPL
                 var final = sam.Snap;
                 bool ready = sam.FastDataTick >= 3 && final.ProcessCount > 0 &&
                              final.RamTotal > 0 && final.AvailMB > 0 &&
-                             sam.GpuReady && sam.GpuDataTick >= 2 &&
+                             sam.GpuFresh && sam.GpuDataTick >= 2 &&
                              (final.GpuPct <= 0 || final.Rows.Any(r => r.Gpu > 0));
                 if (!ready)
                     log.AppendLine("readiness: fastTicks=" + sam.FastDataTick +
                                    " gpuTicks=" + sam.GpuDataTick +
-                                   " gpuReady=" + sam.GpuReady +
+                                   " gpuReady=" + sam.GpuFresh +
                                    " processes=" + final.ProcessCount +
                                    " ramTotal=" + final.RamTotal +
                                    " availableMB=" + final.AvailMB +
@@ -7447,11 +8018,13 @@ namespace PSPL
                                    " gpuRows=" + final.Rows.Count(r => r.Gpu > 0));
                 sam.Stop();
                 log.AppendLine(errs.Count == 0 && ready && atomicGpuPublication && pidSafeCpuDelta &&
-                                cpuReadFailureRecovery && gpuCounterFailureIsolation && gpuWarmupSafety
+                                cpuReadFailureRecovery && gpuCounterFailureIsolation && gpuWarmupSafety &&
+                                gpuFreshnessSafety
                                  && processIdentitySafety && nativeStatusSafety && resourceReleaseSafety
                                  && startupPrivilegeSafety && startupDisabledStateSafety &&
                                  concurrentRuleSafety && backupRuleSafety
-                                && recoveryBudgetSafety && searchFilterSafety &&
+                                && recoveryBudgetSafety && searchFilterSafety && processViewSafety &&
+                                unavailableGpuRenderingSafety && calmRefreshCadenceSafety &&
                                 optimizerPolicySafety && adaptiveTop20Safety &&
                                 aiAutomationSafety &&
                                 monitorPrioritySafety && diagnosticInstanceScopeSafety

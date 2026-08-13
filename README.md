@@ -4,10 +4,12 @@ A native Windows real-time system monitor and process manager with an optional
 PowerShell terminal edition. The included `PSProcLassoGUI.exe` is ready to run;
 its complete WinForms source is in `PSProcLassoGUI.cs`.
 
-It shows every running application with per-process **CPU %, RAM working set,
-GPU engine %, and dedicated VRAM**, ranked by the resource you select. The GUI
-uses stable in-place rows and double buffering, so live updates remain calm
-instead of blinking.
+It shows every running process with live **CPU %, RAM working set, GPU engine %,
+and dedicated VRAM**, ranked by the resource you select. The default one-PID
+view is directly comparable with Process Lasso and Task Manager; an optional
+**Group apps** checkbox aggregates related processes when that view is useful.
+The GUI uses stable in-place rows and double buffering, so live updates remain
+calm instead of blinking.
 
 The adaptive performance mode continuously measures the 20 heaviest application
 groups by CPU, RAM, and GPU, removes app-owned resource caps, expands safe
@@ -62,7 +64,8 @@ Switches:
 There is also a **native Windows GUI** compiled from C# (WinForms, .NET Framework 4.x) —
 no runtime install, no dependencies, runs on any Windows 10/11 machine. It uses the same
 sampling core as the TUI (kernel thread-time CPU, `PerformanceCounter` objects held open
-for ~1 ms reads, GPU/VRAM counters at ~1 Hz, ~200 ms CPU/RAM ticks) and **shares the same
+for ~1 ms reads, GPU/VRAM counters at ~1 Hz, 150 ms warm-up and ~500 ms steady
+CPU/RAM samples) and **shares the same
 `rules.json`** — limits, priorities, watchdog and ProBalance rules you set in one app apply
 in the other.
 
@@ -76,17 +79,18 @@ cd F:\study\projects\SystemMonitor\PSProcLasso
 What you get:
 
 * Dark real-time dashboard: animated CPU / RAM / GPU / VRAM meter bars with load colors
-  (green → yellow → red), live system totals, and every application family ranked by CPU
+  (green → yellow → red), live system totals, and every process ranked by CPU
   / RAM / GPU / VRAM / name / PID — **click any column header to re-rank instantly**, or use the three
   **CPU / RAM / GPU sort buttons** in the header (every click sorts that metric descending,
   highest usage first; the active button glows cyan). Column headers can still toggle
   direction when an ascending view is intentionally needed.
-* Related processes are folded into one stable application row. Exact-name workers and
-  known families such as WSL and Windows Script Host show one aggregated CPU/RAM/GPU/VRAM
-  result, while retaining every member PID for copy, details, and actions.
+* The default **Processes** view always shows one stable row per PID, making the resource
+  leader easy to verify against other Windows monitors. Enable **Group apps** to fold
+  exact-name workers and known families such as WSL and Windows Script Host into an
+  aggregated application row while retaining every member PID for copy, details, and actions.
 * **Instant search** — use the always-visible search box or press `Ctrl+F`, then type any
-  combination of application name, member PID, executable path, priority, affinity, or
-  active control. Tokens are matched together against grouped application rows. Press
+  combination of process/application name, PID, executable path, priority, affinity, or
+  active control. Tokens are matched together against the current view. Press
   `Esc` or the clear button to restore the complete live table immediately.
 * **Safe whole-system optimization** — the **OPTIMIZE** button reviews every observed PID
   and records an explicit decision. It never terminates a process, never applies High or
@@ -108,15 +112,15 @@ What you get:
 * The lightweight monitor process corrects inherited Idle, Below Normal, or Normal
   launcher priority to **Above Normal**, keeping sampling and the UI responsive under
   heavy load. It never promotes itself to Realtime, and inherited High stays High.
-* Per-application actions expand to every member process: priority (Idle → Realtime),
-  core affinity, **Windows Job Object
+* Per-process actions cover priority (Idle → Realtime), core affinity, **Windows Job Object
   hard CPU and RAM caps** where the target permits assignment, a whole-process **GPU duty
-  limit**, kill, watchdog, ProBalance, and deep details.
+  limit**, kill, watchdog, ProBalance, and deep details. In grouped mode, actions expand
+  to every member process.
 * **Bulk AI copy** — press and hold the left mouse button, drag across rows, and keep
   dragging at an edge (or use the wheel) to auto-scroll and turn the whole range blue.
   Ctrl/Shift-selection remains available. Then press `Ctrl+C` or click
   **COPY** to place a tab-separated snapshot on the clipboard with system totals plus
-  application count, every member PID, CPU, RAM, private commit, GPU, VRAM, priority,
+  visible-row count, every member PID, CPU, RAM, private commit, GPU, VRAM, priority,
   affinity, and active controls.
   `Ctrl+A` / **SELECT ALL** selects the complete visible process table. Clipboard writes
   use bounded retries so a brief lock by another application does not lose the copy.
@@ -155,11 +159,12 @@ Sanity checks (all headless, all print `RESULT: OK` with zero exceptions):
 | Switch | What it proves |
 |---|---|
 | `--selftest` | 5 s of real sampling — CPU / GPU / process count / RAM / VRAM / available / standby, per cycle |
-| `--uicheck` | hidden full-GUI construction and paint check, including application-family grouping, embedded executable icon, click-drag range selection with edge auto-scroll, correct visible CPU/RAM/GPU leaders, stable row reuse, bulk copy, and quick actions |
+| `--accuracycheck` | repeated independent Windows readings compared with the sampler's top CPU, RAM, and GPU process sets |
+| `--uicheck` | hidden full-GUI construction and paint check, including default one-PID rows, optional grouping, honest unavailable-GPU markers, embedded executable icon, click-drag range selection, correct visible CPU/RAM/GPU leaders, stable row reuse, and bulk copy |
 | `--timing` | measured pass times: fast cycle, GPU pass, and the GPU pass-to-pass wall gap |
 | `--startup` | time to first process table, first CPU/RAM totals, and first GPU data |
 | `--cadence` | steady-state CPU/RAM refresh is ~500 ms and GPU refresh is ~1 s |
-| `--report [path]` | **all reports in one run** — runs every check above (~30 s) and writes a single consolidated report with a final verdict (`ALL REPORTS PASSED` / `FAIL`); defaults to `%TEMP%\pspl-gui-report.txt`, or pass your own path |
+| `--report [path]` | **all eight reports in one run** — includes independent accuracy, sampling cadence, startup, UI paint, enforcement, and recovery checks, then writes a consolidated verdict (`ALL REPORTS PASSED` / `FAIL`); defaults to `%TEMP%\pspl-gui-report.txt`, or pass your own path |
 | `--ai-snapshot [path]` | writes `psproclasso.snapshot.v1` JSON with live system totals and grouped application metrics; defaults to `%TEMP%\psproclasso-snapshot.json` |
 | `--optimize-plan [path]` | dry-run classification for every observed PID; writes `psproclasso.optimization.v1` JSON and changes nothing |
 | `--optimize-apply [path]` | applies only the safe plan, atomically merges optimizer-owned persistent rules, and writes a per-PID receipt |
@@ -191,8 +196,9 @@ taskbar pinning, the title bar, and the notification area.
   thread so it can never delay the table or totals. GPU data arrives once Windows
   finishes creating the ~600 GPU counters (~3.5 s at 100% CPU, ~1 s on an idle machine;
   the meter shows `initializing…` until then).
-* **Refresh cadence: CPU/RAM/process rankings update every 500 ms** and GPU rankings
-  update about every 1 second. GPU counter instances are reconciled on every GPU pass,
+* **Refresh cadence:** CPU/RAM/process data is sampled every 500 ms and GPU data about
+  every 1 second. The visible table commits the newest coherent snapshot once per second,
+  reducing visual churn without slowing collection. GPU counter instances are reconciled on every GPU pass,
   so newly GPU-active applications appear in the next update and stopped applications
   clear instead of retaining stale usage.
 * **Correct GPU semantics:** each process shows its busiest GPU engine, matching the
@@ -200,7 +206,8 @@ taskbar pinning, the title bar, and the notification area.
   engines into impossible values above 100%. The total meter uses the busiest physical
   engine across the system. Windows rate counters are explicitly warmed before their
   first value is published, so their primer sample remains `initializing...` instead of
-  appearing as a false zero. Multi-selection reports `GPU top` rather than adding
+  appearing as a false zero. Missing or stale GPU data is shown as `--`, never as a
+  fabricated `0%`; a fresh valid zero remains `0%`. Multi-selection reports `GPU top` rather than adding
   unrelated per-process engine peaks into a misleading aggregate percentage.
   A grouped application sums its members on each physical engine and then takes that
   application's busiest engine, avoiding both under-counting and impossible totals.
@@ -213,8 +220,8 @@ taskbar pinning, the title bar, and the notification area.
   unchanged, preserving selection and scroll position without weakening ranking
   correctness with a deadband.
 * **Readable small percentages without false zeroes:** genuine zero usage is shown as
-  `0%`, nonzero usage below `0.01%` is shown as `<0.01%`, sub-1% usage keeps two
-  decimal places, and larger values use one decimal place.
+  `0%`, unavailable GPU usage is `--`, nonzero usage below `0.01%` is shown as
+  `<0.01%`, sub-1% usage keeps two decimal places, and larger values use one decimal place.
 * **Calm live updates:** the process list is double-buffered and reuses existing rows.
   Changed cells are committed as one buffered frame, and a live re-sort moves only the
   rows whose order changed. This avoids the visible clear-and-rebuild blink while still
@@ -318,8 +325,9 @@ driver-backed controls.
 
 ## Performance & accuracy notes
 
-* While the dashboard is visible, per-process CPU % and RAM refresh every
-  500 ms and GPU % / VRAM refresh every ~1 second. Hidden/tray enforcement
+* While the dashboard is visible, per-process CPU % and RAM are sampled every
+  500 ms, GPU % / VRAM every ~1 second, and the table paints one coherent latest
+  frame each second. Hidden/tray enforcement
   avoids repainting the invisible table, samples CPU/RAM every second, and
   samples GPU plus reapplies the adaptive top set every 5 seconds. Showing the
   window immediately restores the full visible cadence.
