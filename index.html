@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PSProcLasso — Live Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1c2129; --border: #2d333b;
+    --text: #e6edf3; --dim: #8b949e; --green: #3fb950; --yellow: #d29922;
+    --red: #f85149; --cyan: #58a6ff; --magenta: #bc8cff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 13px/1.45 "Cascadia Code", Consolas, "Segoe UI", monospace; }
+  header { display: flex; align-items: baseline; gap: 14px; padding: 14px 18px;
+           border-bottom: 1px solid var(--border); background: var(--panel); flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; color: var(--cyan); }
+  header .sub { color: var(--dim); font-size: 12px; }
+  #live { padding: 2px 9px; border-radius: 10px; font-size: 11px; font-weight: 700;
+          background: var(--panel2); border: 1px solid var(--border); }
+  #live.fresh { color: var(--green); }
+  #live.stale { color: var(--yellow); }
+  #live.off   { color: var(--red); }
+  #updated { color: var(--dim); font-size: 12px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+           gap: 10px; padding: 14px 18px; }
+  .card { background: var(--panel); border: 1px solid var(--border);
+          border-radius: 8px; padding: 10px 12px; }
+  .card .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+  .card .v { font-size: 18px; margin-top: 4px; font-weight: 700; }
+  .card .s { color: var(--dim); font-size: 11px; margin-top: 2px; }
+  .toolbar { display: flex; align-items: center; gap: 10px; padding: 10px 18px; flex-wrap: wrap; }
+  .toolbar input { background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+                   border-radius: 6px; padding: 6px 10px; width: 220px; font: inherit; }
+  .btn { background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+         border-radius: 6px; padding: 6px 11px; cursor: pointer; font: inherit; }
+  .btn:hover { border-color: var(--cyan); }
+  .btn.active { border-color: var(--cyan); color: var(--cyan); }
+  #meta { color: var(--dim); font-size: 12px; margin-left: auto; }
+  table { width: 100%; border-collapse: collapse; margin: 0 0 14px; }
+  th, td { text-align: left; padding: 5px 10px; border-bottom: 1px solid var(--border);
+           white-space: nowrap; }
+  th { position: sticky; top: 0; background: var(--panel); cursor: pointer; user-select: none;
+       color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+  th.sorted { color: var(--cyan); }
+  th .arrow { opacity: .7; }
+  td.num, th.num { text-align: right; }
+  tr:hover td { background: rgba(88,166,255,.06); }
+  .cpu-hot   { color: var(--red); font-weight: 700; }
+  .cpu-warm  { color: var(--yellow); }
+  .gpu-hot   { color: var(--yellow); }
+  .watched   { color: var(--magenta); }
+  .wrap { padding: 0 18px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+           padding: 12px 14px; margin: 14px 0; }
+  .panel h2 { margin: 0 0 8px; font-size: 13px; color: var(--cyan); }
+  code { background: var(--panel2); border: 1px solid var(--border); border-radius: 4px;
+         padding: 1px 6px; }
+  pre { background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+        padding: 10px 12px; overflow-x: auto; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  .dim { color: var(--dim); }
+  .errbar { color: var(--red); padding: 8px 18px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>PSProcLasso</h1>
+  <span class="sub">live dashboard · process lasso style · every process, exact CPU / RAM / GPU / VRAM</span>
+  <span id="live" class="stale">connecting…</span>
+  <span id="updated"></span>
+</header>
+
+<div class="cards" id="cards"></div>
+
+<div class="toolbar">
+  <input id="filter" type="text" placeholder="filter by name or PID…">
+  <span class="dim">sort:</span>
+  <button class="btn active" data-sort="cpu">CPU</button>
+  <button class="btn" data-sort="ram">RAM</button>
+  <button class="btn" data-sort="gpu">GPU</button>
+  <button class="btn" data-sort="name">Name</button>
+  <button class="btn" data-sort="pid">PID</button>
+  <span id="meta"></span>
+</div>
+<div id="errbar" class="errbar" style="display:none"></div>
+
+<div class="wrap">
+  <table>
+    <thead><tr>
+      <th data-key="rank" class="num">#</th>
+      <th data-key="pid" class="num">PID</th>
+      <th data-key="name">NAME</th>
+      <th data-key="cpu" class="num">CPU %</th>
+      <th data-key="mem" class="num">MEMORY</th>
+      <th data-key="gpu" class="num">GPU %</th>
+      <th data-key="vram" class="num">VRAM</th>
+      <th data-key="priority">PRIORITY</th>
+      <th data-key="affinity">AFFINITY</th>
+      <th data-key="threads" class="num">THREADS</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+
+<div class="wrap grid2">
+  <div class="panel">
+    <h2>Run the real TUI in your PowerShell terminal</h2>
+    <pre>powershell -ExecutionPolicy Bypass -File .\PSProcLasso.ps1</pre>
+    <div class="dim">
+      Full ranked table · sort by CPU / RAM / GPU · filter · priority (<code>p</code>) ·
+      core affinity (<code>a</code>) · CPU cap (<code>l</code>) · kill (<code>k</code>) ·
+      watchdog (<code>w</code>) · ProBalance (<code>b</code>) · details (<code>i</code>) ·
+      rules (<code>r</code>) · launch (<code>e</code>) · quit (<code>q</code>) — <code>?</code> for help.
+      Zero exceptions: every failure is caught, shown on the status line, and logged to
+      <code>%USERPROFILE%\.psproclasso\events.log</code>.
+    </div>
+  </div>
+  <div class="panel">
+    <h2>About this page</h2>
+    <div class="dim">
+      This dashboard is the app's own output: the server refreshes
+      <code>PSProcLasso.ps1 -Snapshot</code> every few seconds (same sampling code as the TUI —
+      kernel thread-time CPU deltas, working-set RAM, and the Task Manager GPU counters) and
+      serves the ranked table here. Numbers above 90% CPU are red, 50%+ amber. Click any column
+      to re-rank, type to filter.
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const REFRESH_MS = 8000;
+let state = { sort: 'cpu', desc: true, data: null, updatedAt: null };
+
+function fmtBytes(b) {
+  if (b == null || b < 0) return 'n/a';
+  const u = ['B','KB','MB','GB','TB'];
+  let i = 0; let v = b;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(1)) + ' ' + u[i];
+}
+
+function live() {
+  const el = $('live');
+  if (!state.updatedAt) { el.className = 'off'; el.textContent = 'no data'; return; }
+  const age = (Date.now() - new Date(state.updatedAt).getTime()) / 1000;
+  if (age < 45000) { el.className = 'fresh'; el.textContent = '● LIVE'; }
+  else { el.className = 'stale'; el.textContent = 'stale ' + Math.round(age) + 's'; }
+  $('updated').textContent = 'updated ' + new Date(state.updatedAt).toLocaleTimeString() +
+    ' · refreshed every ' + (REFRESH_MS / 1000) + 's';
+}
+
+function renderCards(d) {
+  const s = d.data, cards = $('cards');
+  const memPct = s.ramTotal > 0 ? (100 * s.ramUsed / s.ramTotal).toFixed(1) : '0';
+  const vram = s.gpuOn
+    ? (s.vramTotal > 0 ? fmtBytes(s.vramUsed) + ' / ' + fmtBytes(s.vramTotal) : fmtBytes(s.vramUsed))
+    : 'n/a';
+  cards.innerHTML =
+    card('CPU', s.totalCpu + '%', 'total processor time') +
+    card('RAM', fmtBytes(s.ramUsed) + ' / ' + fmtBytes(s.ramTotal), memPct + '% used · ' + fmtBytes(s.availMB * 1048576) + ' available') +
+    card('GPU', s.gpuOn ? s.gpuPct + '%' : 'n/a', 'VRAM ' + vram) +
+    card('Standby cache', fmtBytes(s.standby), 'available RAM re-cacheable') +
+    card('Processes', s.processes, s.rules + ' persisted rule(s) · ' + s.errors + ' swallowed error(s)');
+  function card(k, v, sub) {
+    return '<div class="card"><div class="k">' + k + '</div><div class="v">' + v +
+           '</div><div class="s">' + sub + '</div></div>';
+  }
+}
+
+function renderTable() {
+  const rows = $('rows');
+  const d = state.data;
+  if (!d || !d.procs) { rows.innerHTML = '<tr><td colspan="10" class="dim">waiting for data…</td></tr>'; return; }
+  const q = $('filter').value.trim().toLowerCase();
+  let list = d.procs.slice();
+  if (q) list = list.filter(p => p.name.toLowerCase().includes(q) || String(p.pid) === q);
+  // button labels vs. JSON field names: 'RAM' sorts the 'mem' field
+  const key = state.sort === 'ram' ? 'mem' : state.sort;
+  list.sort((a, b) => {
+    if (key === 'name') return state.desc ? b.name.localeCompare(a.name) : a.name.localeCompare(b.name);
+    const av = (key === 'priority' || key === 'affinity') ? 0 : (a[key] || 0);
+    const bv = (key === 'priority' || key === 'affinity') ? 0 : (b[key] || 0);
+    return state.desc ? bv - av : av - bv;
+  });
+  rows.innerHTML = list.slice(0, 400).map((p, i) => {
+    const cpuCls = p.cpu >= 90 ? 'cpu-hot' : p.cpu >= 50 ? 'cpu-warm' : '';
+    const gpuCls = p.gpu >= 50 ? 'gpu-hot' : '';
+    return '<tr>' +
+      '<td class="num dim">' + (i + 1) + '</td>' +
+      '<td class="num">' + p.pid + '</td>' +
+      '<td>' + esc(p.name) + '</td>' +
+      '<td class="num ' + cpuCls + '">' + p.cpu.toFixed(1) + '</td>' +
+      '<td class="num">' + fmtBytes(p.mem) + '</td>' +
+      '<td class="num ' + gpuCls + '">' + p.gpu.toFixed(1) + '</td>' +
+      '<td class="num">' + fmtBytes(p.vram) + '</td>' +
+      '<td>' + esc(p.priority) + '</td>' +
+      '<td>' + esc(p.affinity) + '</td>' +
+      '<td class="num">' + p.threads + '</td>' +
+      '</tr>';
+  }).join('');
+  $('meta').textContent = list.length + ' of ' + d.processes + ' processes · ' +
+    (state.desc ? '▼' : '▲') + ' ' + state.sort.toUpperCase();
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/api/snapshot');
+    const j = await r.json();
+    if (j.ok && j.data) {
+      state.data = j.data;
+      state.updatedAt = j.updatedAt || new Date().toISOString();
+      $('errbar').style.display = 'none';
+      renderCards(j);
+    } else if (j.lastError) {
+      $('errbar').style.display = 'block';
+      $('errbar').textContent = 'sampler error: ' + j.lastError;
+    }
+  } catch (e) {
+    $('errbar').style.display = 'block';
+    $('errbar').textContent = 'cannot reach server: ' + e.message;
+  }
+  renderTable();
+  live();
+}
+
+document.querySelectorAll('.btn[data-sort]').forEach(b => {
+  b.addEventListener('click', () => {
+    const k = b.dataset.sort;
+    if (state.sort === k) state.desc = !state.desc; else { state.sort = k; state.desc = true; }
+    document.querySelectorAll('.btn[data-sort]').forEach(x => x.classList.toggle('active', x.dataset.sort === state.sort));
+    renderTable();
+  });
+});
+document.querySelectorAll('th[data-key]').forEach(th => {
+  th.addEventListener('click', () => {
+    const k = th.dataset.key;
+    if (k === 'rank') return;
+    if (state.sort === k) state.desc = !state.desc; else { state.sort = k; state.desc = true; }
+    document.querySelectorAll('.btn[data-sort]').forEach(x => x.classList.toggle('active', x.dataset.sort === state.sort));
+    renderTable();
+  });
+});
+$('filter').addEventListener('input', renderTable);
+
+poll();
+setInterval(poll, REFRESH_MS);
+</script>
+</body>
+</html>

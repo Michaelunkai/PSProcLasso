@@ -1,0 +1,13 @@
+# Local verification and machine-specific evidence
+.agents/
+
+# Superseded or currently loaded build snapshots
+PSProcLassoGUI.previous-*.exe
+PSProcLassoGUI.running-*.exe
+PSProcLassoGUI.top20-*.exe
+
+# Local runtime state
+*.log
+*.tmp
+bin/
+obj/
