@@ -25,6 +25,13 @@ using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
+[assembly: System.Reflection.AssemblyTitle("PSProcLasso")]
+[assembly: System.Reflection.AssemblyProduct("PSProcLasso")]
+[assembly: System.Reflection.AssemblyDescription("Real-time Windows CPU, RAM, and GPU monitor with safe durable optimization")]
+[assembly: System.Reflection.AssemblyCompany("PSProcLasso")]
+[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
+
 namespace PSPL
 {
     // ---------------------------------------------------------------------
@@ -389,6 +396,7 @@ namespace PSPL
         public OptimizationReceipt actions { get; set; }
         public int restoredLegacyPolicies { get; set; }
         public bool startupEnabled { get; set; }
+        public bool durableOptimizationEnabled { get; set; }
         public string persistenceScope { get; set; }
         public string tpuStatus { get; set; }
         public string receiptPath { get; set; }
@@ -713,6 +721,171 @@ namespace PSPL
         }
     }
 
+    internal class DurableOptimizationSettings
+    {
+        public string schema { get; set; }
+        public bool enabled { get; set; }
+        public int intervalSeconds { get; set; }
+
+        public static DurableOptimizationSettings Default()
+        {
+            return new DurableOptimizationSettings
+            {
+                schema = "psproclasso.settings.v1",
+                enabled = false,
+                intervalSeconds = 60
+            };
+        }
+    }
+
+    internal static class DurableOptimizationStore
+    {
+        private const string MutexName = "Local\\PSProcLasso.SettingsStore.v1";
+
+        public static string FilePath
+        {
+            get
+            {
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".psproclasso", "settings.json");
+            }
+        }
+
+        public static DurableOptimizationSettings Load()
+        {
+            return LoadFromPath(FilePath);
+        }
+
+        public static bool IsEnabled()
+        {
+            return Load().enabled;
+        }
+
+        public static bool SetEnabled(bool enabled, out string error)
+        {
+            DurableOptimizationSettings settings = Load();
+            settings.enabled = enabled;
+            settings.schema = "psproclasso.settings.v1";
+            settings.intervalSeconds = NormalizeInterval(settings.intervalSeconds);
+            return SaveToPath(FilePath, settings, out error);
+        }
+
+        internal static int NormalizeInterval(int seconds)
+        {
+            return Math.Max(30, Math.Min(300, seconds <= 0 ? 60 : seconds));
+        }
+
+        private static DurableOptimizationSettings LoadFromPath(string path)
+        {
+            DurableOptimizationSettings settings;
+            if (TryRead(path, out settings)) return Normalize(settings);
+            if (TryRead(path + ".bak", out settings)) return Normalize(settings);
+            return DurableOptimizationSettings.Default();
+        }
+
+        private static DurableOptimizationSettings Normalize(
+            DurableOptimizationSettings settings)
+        {
+            if (settings == null) settings = DurableOptimizationSettings.Default();
+            settings.schema = "psproclasso.settings.v1";
+            settings.intervalSeconds = NormalizeInterval(settings.intervalSeconds);
+            return settings;
+        }
+
+        private static bool TryRead(string path,
+                                    out DurableOptimizationSettings settings)
+        {
+            settings = null;
+            try
+            {
+                if (!File.Exists(path)) return false;
+                settings = new JavaScriptSerializer()
+                    .Deserialize<DurableOptimizationSettings>(File.ReadAllText(path));
+                return settings != null;
+            }
+            catch { return false; }
+        }
+
+        private static bool SaveToPath(string path,
+                                       DurableOptimizationSettings settings,
+                                       out string error)
+        {
+            error = "";
+            Mutex mutex = null;
+            bool held = false;
+            string temp = path + "." + Process.GetCurrentProcess().Id + "." +
+                          Thread.CurrentThread.ManagedThreadId + ".tmp";
+            try
+            {
+                mutex = new Mutex(false, MutexName);
+                try { held = mutex.WaitOne(10000); }
+                catch (AbandonedMutexException) { held = true; }
+                if (!held)
+                {
+                    error = "Timed out waiting for the settings file lock.";
+                    return false;
+                }
+                settings = Normalize(settings);
+                string dir = Path.GetDirectoryName(path);
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                string json = new JavaScriptSerializer().Serialize(settings);
+                File.WriteAllText(temp, json, new UTF8Encoding(false));
+                if (File.Exists(path))
+                {
+                    try { File.Replace(temp, path, path + ".bak", true); }
+                    catch
+                    {
+                        File.Copy(path, path + ".bak", true);
+                        File.Copy(temp, path, true);
+                        File.Delete(temp);
+                    }
+                }
+                else File.Move(temp, path);
+                return true;
+            }
+            catch (Exception ex) { error = ex.Message; return false; }
+            finally
+            {
+                try { File.Delete(temp); } catch { }
+                if (held) try { mutex.ReleaseMutex(); } catch { }
+                if (mutex != null) mutex.Dispose();
+            }
+        }
+
+        internal static bool VerifyContract()
+        {
+            string dir = Path.Combine(Path.GetTempPath(),
+                "pspl-settings-contract-" + Process.GetCurrentProcess().Id + "-" +
+                Guid.NewGuid().ToString("N"));
+            string path = Path.Combine(dir, "settings.json");
+            try
+            {
+                Directory.CreateDirectory(dir);
+                DurableOptimizationSettings defaults = LoadFromPath(path);
+                string error;
+                if (defaults.enabled || defaults.intervalSeconds != 60 ||
+                    !SaveToPath(path, new DurableOptimizationSettings
+                    {
+                        enabled = true,
+                        intervalSeconds = 5
+                    }, out error)) return false;
+                DurableOptimizationSettings enabled = LoadFromPath(path);
+                if (!enabled.enabled || enabled.intervalSeconds != 30) return false;
+                if (!SaveToPath(path, new DurableOptimizationSettings
+                    {
+                        enabled = false,
+                        intervalSeconds = 600
+                    }, out error)) return false;
+                File.WriteAllText(path, "{broken-json", new UTF8Encoding(false));
+                DurableOptimizationSettings recovered = LoadFromPath(path);
+                return recovered.enabled && recovered.intervalSeconds == 30;
+            }
+            catch { return false; }
+            finally { try { Directory.Delete(dir, true); } catch { } }
+        }
+    }
+
     internal static class StartupManager
     {
         public const string TaskName = "PSProcLasso Background Enforcer";
@@ -753,7 +926,7 @@ namespace PSPL
             return
                     "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
                     "<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n" +
-                    "  <RegistrationInfo><Description>Silently enforces PSProcLasso process rules after every sign-in.</Description></RegistrationInfo>\r\n" +
+                    "  <RegistrationInfo><Description>Silently re-evaluates safe PSProcLasso optimization and enforces saved rules after every sign-in.</Description></RegistrationInfo>\r\n" +
                     "  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + SecurityElement.Escape(user) + "</UserId></LogonTrigger></Triggers>\r\n" +
                     "  <Principals><Principal id=\"Author\"><UserId>" + SecurityElement.Escape(user) + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n" +
                     "  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings><RestartOnFailure><Interval>PT1M</Interval><Count>255</Count></RestartOnFailure><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>true</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>5</Priority></Settings>\r\n" +
@@ -768,6 +941,23 @@ namespace PSPL
             string xml = BuildTaskXml(@"C:\Apps\PSProcLassoGUI.exe", @"DOMAIN\User");
             return xml.Contains("<RunLevel>LeastPrivilege</RunLevel>") &&
                    !xml.Contains("<RunLevel>HighestAvailable</RunLevel>");
+        }
+
+        internal static bool VerifyPopupFreeContract()
+        {
+            const string exe = @"C:\Apps\PSProcLassoGUI.exe";
+            string xml = BuildTaskXml(exe, @"DOMAIN\User");
+            ProcessStartInfo psi = BuildTaskProcessStartInfo("/Query");
+            string lower = xml.ToLowerInvariant();
+            return xml.Contains("<Hidden>true</Hidden>") &&
+                   xml.Contains("<Command>" + exe + "</Command>") &&
+                   xml.Contains("<Arguments>--background</Arguments>") &&
+                   !lower.Contains("powershell") &&
+                   !lower.Contains("cmd.exe") &&
+                   !lower.Contains("conhost") &&
+                   !psi.UseShellExecute && psi.CreateNoWindow &&
+                   psi.WindowStyle == ProcessWindowStyle.Hidden &&
+                   psi.RedirectStandardOutput && psi.RedirectStandardError;
         }
 
         private static bool TaskXmlIsEnabled(string xml)
@@ -806,11 +996,11 @@ namespace PSPL
             {
                 if (RunTaskCommand("/Query /TN \"" + TaskName + "\" /FO LIST", 8000) != 0)
                     return true;
-                if (!IsEnabled()) return true;
-                int exit = RunTaskCommand("/Change /TN \"" + TaskName + "\" /Disable", 10000);
-                if (exit != 0 || IsEnabled())
+                int exit = RunTaskCommand("/Delete /TN \"" + TaskName + "\" /F", 10000);
+                if (exit != 0 ||
+                    RunTaskCommand("/Query /TN \"" + TaskName + "\" /FO LIST", 8000) == 0)
                 {
-                    error = "Could not disable the startup task (exit " + exit + ").";
+                    error = "Could not remove the startup task (exit " + exit + ").";
                     return false;
                 }
                 return true;
@@ -827,16 +1017,7 @@ namespace PSPL
         private static int RunTaskCommand(string arguments, int timeoutMs, out string output)
         {
             output = "";
-            var psi = new ProcessStartInfo
-            {
-                FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "schtasks.exe"),
-                Arguments = arguments,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
+            ProcessStartInfo psi = BuildTaskProcessStartInfo(arguments);
             using (var p = Process.Start(psi))
             {
                 if (!p.WaitForExit(timeoutMs))
@@ -854,6 +1035,73 @@ namespace PSPL
                 return p.ExitCode;
             }
         }
+
+        private static ProcessStartInfo BuildTaskProcessStartInfo(string arguments)
+        {
+            return new ProcessStartInfo
+            {
+                FileName = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.System),
+                    "schtasks.exe"),
+                Arguments = arguments,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+        }
+    }
+
+    internal static class DurableOptimizationManager
+    {
+        public static bool IsEnabled()
+        {
+            return DurableOptimizationStore.IsEnabled() && StartupManager.IsEnabled();
+        }
+
+        public static bool Enable(out string error)
+        {
+            error = "";
+            bool previous = DurableOptimizationStore.IsEnabled();
+            string settingsError;
+            if (!DurableOptimizationStore.SetEnabled(true, out settingsError))
+            {
+                error = "Could not save durable optimization settings: " + settingsError;
+                return false;
+            }
+            string startupError;
+            if (StartupManager.Enable(out startupError)) return true;
+
+            string rollbackError;
+            DurableOptimizationStore.SetEnabled(previous, out rollbackError);
+            error = "Could not enable popup-free Windows startup: " + startupError;
+            if (!String.IsNullOrWhiteSpace(rollbackError))
+                error += " Settings rollback also failed: " + rollbackError;
+            return false;
+        }
+
+        public static bool Disable(out string error)
+        {
+            error = "";
+            string settingsError = "";
+            bool settingsExists = File.Exists(DurableOptimizationStore.FilePath) ||
+                                  File.Exists(DurableOptimizationStore.FilePath + ".bak");
+            bool settingsSaved = !settingsExists ||
+                DurableOptimizationStore.SetEnabled(false, out settingsError);
+            if (!settingsExists) settingsError = "";
+            string startupError;
+            bool startupRemoved = StartupManager.Disable(out startupError);
+            if (settingsSaved && startupRemoved) return true;
+            if (!settingsSaved)
+                error = "Could not disable durable optimization settings: " + settingsError;
+            if (!startupRemoved)
+            {
+                if (!String.IsNullOrWhiteSpace(error)) error += " ";
+                error += "Could not remove Windows startup: " + startupError;
+            }
+            return false;
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -870,6 +1118,8 @@ namespace PSPL
         // continuously could promote a background worker that the safe optimizer had
         // just deprioritized, so the normal GUI uses one coherent policy instead.
         public volatile bool AdaptiveTop20Enabled = false;
+        public volatile bool DurableOptimizationEnabled = false;
+        public volatile int DurableOptimizationIntervalMs = 60000;
 
         public ConcurrentDictionary<string, Rule> Rules;
         public ConcurrentDictionary<int, GpuLimitState> GpuLimits = new ConcurrentDictionary<int, GpuLimitState>();
@@ -938,6 +1188,9 @@ namespace PSPL
         private volatile int _gpuIntervalMs = 1000;      // Windows GPU counters are reliable at ~1 Hz
         private volatile int _adaptiveIntervalMs = 2000;
         private int _lastAdaptiveTop20Ms;
+        private int _lastDurableOptimizationMs;
+        private int _durableOptimizationWorker;
+        private Thread _durableOptimizationThread;
         private int _lastAdaptivePersistenceMs;
         private string _adaptiveRuleFingerprint = "";
         private readonly Dictionary<string, int> _adaptiveApplicationLastSeen =
@@ -1026,6 +1279,12 @@ namespace PSPL
             try { if (_gpuThread != null) _gpuThread.Join(2000); } catch { }
             try { if (_pathThread != null) _pathThread.Join(2000); } catch { }
             try { if (_enforcementThread != null) _enforcementThread.Join(2000); } catch { }
+            try
+            {
+                if (_durableOptimizationThread != null)
+                    _durableOptimizationThread.Join(5000);
+            }
+            catch { }
             // never leave a process suspended
             foreach (var kv in GpuLimits)
             {
@@ -1264,8 +1523,80 @@ namespace PSPL
             StepCpuLimits();
             StepRamLimits();
             StepProBalance();
+            StepDurableOptimization();
             StepAdaptiveTop20();
             StepWatchdog();
+        }
+
+        private void StepDurableOptimization()
+        {
+            int now = Environment.TickCount;
+            if (!DurableOptimizationDue(DurableOptimizationEnabled, FastDataTick,
+                    _lastDurableOptimizationMs, now,
+                    DurableOptimizationIntervalMs,
+                    Interlocked.CompareExchange(ref _durableOptimizationWorker, 0, 0)))
+                return;
+            if (Interlocked.CompareExchange(ref _durableOptimizationWorker, 1, 0) != 0)
+                return;
+            _lastDurableOptimizationMs = now;
+            Snapshot snapshot = Snap;
+            _durableOptimizationThread = new Thread(delegate()
+            {
+                try
+                {
+                    OptimizationReceipt receipt =
+                        SafeOptimizer.Execute(snapshot, "apply");
+                    Rules = RulesStore.Load();
+                    if (receipt != null && receipt.errors != null &&
+                        receipt.errors.Count > 0)
+                        AddError("durable optimizer: " + receipt.errors[0]);
+                }
+                catch (Exception ex)
+                {
+                    AddError("durable optimizer: " + ex.Message);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _durableOptimizationWorker, 0);
+                }
+            });
+            _durableOptimizationThread.IsBackground = true;
+            _durableOptimizationThread.Priority = ThreadPriority.BelowNormal;
+            _durableOptimizationThread.Start();
+        }
+
+        internal bool WaitForDurableOptimizationIdle(int timeoutMs)
+        {
+            Stopwatch wait = Stopwatch.StartNew();
+            while (Interlocked.CompareExchange(
+                       ref _durableOptimizationWorker, 0, 0) != 0)
+            {
+                if (wait.ElapsedMilliseconds >= Math.Max(0, timeoutMs)) return false;
+                Thread.Sleep(25);
+            }
+            return true;
+        }
+
+        internal static bool DurableOptimizationDue(
+            bool enabled, long fastDataTick, int lastTick, int nowTick,
+            int intervalMs, int workerState)
+        {
+            if (!enabled || fastDataTick < 3 || workerState != 0) return false;
+            if (lastTick == 0) return true;
+            int elapsed = unchecked(nowTick - lastTick);
+            return elapsed >= Math.Max(30000, intervalMs);
+        }
+
+        internal static bool VerifyDurableOptimizationContract()
+        {
+            return !DurableOptimizationDue(false, 3, 0, 1000, 60000, 0) &&
+                   !DurableOptimizationDue(true, 2, 0, 1000, 60000, 0) &&
+                   !DurableOptimizationDue(true, 3, 0, 1000, 60000, 1) &&
+                   DurableOptimizationDue(true, 3, 0, 1000, 60000, 0) &&
+                   !DurableOptimizationDue(true, 3, 1000, 60999, 60000, 0) &&
+                   DurableOptimizationDue(true, 3, 1000, 61000, 60000, 0) &&
+                   DurableOptimizationDue(true, 3, Int32.MaxValue - 1000,
+                       Int32.MinValue + 60000, 60000, 0);
         }
 
         // -----------------------------------------------------------------
@@ -3969,8 +4300,11 @@ namespace PSPL
         }
 
         internal const string PersistenceScope =
-            "Saved rules are re-applied to matching processes whenever PSProcLasso is " +
-            "manually running. Windows startup remains unchanged.";
+            "Safe optimization is re-evaluated automatically after every Windows sign-in " +
+            "while the hidden least-privilege enforcer runs.";
+        internal const string ManualPersistenceScope =
+            "The one-time optimization completed, but automatic sign-in persistence could " +
+            "not be verified. Saved rules still apply whenever PSProcLasso is running.";
         internal const string TpuStatus =
             "Windows exposes no general per-process TPU utilization counter; PSProcLasso " +
             "does not fabricate a TPU percentage.";
@@ -4251,6 +4585,10 @@ namespace PSPL
             };
 
             bool restoreGpuOff = !sampler.GpuOn;
+            sampler.DurableOptimizationEnabled = false;
+            if (!sampler.WaitForDurableOptimizationIdle(10000))
+                throw new TimeoutException(
+                    "The existing durable optimizer pass did not finish in time.");
             sampler.GpuOn = true;
             try
             {
@@ -4292,14 +4630,25 @@ namespace PSPL
                     receipt.errors.AddRange(receipt.actions.errors);
                 sampler.Rules = RulesStore.Load();
 
-                Report(progress, 67, "Settling",
+                Report(progress, 66, "Securing persistence",
+                       "Enabling hidden safe re-evaluation after every sign-in.", 0, 1);
+                string persistenceError;
+                receipt.durableOptimizationEnabled =
+                    DurableOptimizationManager.Enable(out persistenceError);
+                if (!receipt.durableOptimizationEnabled)
+                    receipt.errors.Add("persistence: " + persistenceError);
+                receipt.startupEnabled = StartupManager.IsEnabled();
+                receipt.persistenceScope = receipt.durableOptimizationEnabled &&
+                                           receipt.startupEnabled
+                    ? PersistenceScope : ManualPersistenceScope;
+
+                Report(progress, 68, "Settling",
                        "Allowing scheduling changes to stabilize.", 0, 1);
                 Thread.Sleep(1500);
                 receipt.after = Capture(sampler, 6000, 70, 26,
-                                        "Measuring result", progress);
+                                         "Measuring result", progress);
                 receipt.systemImpact = Compare(receipt.before, receipt.after);
                 receipt.applications = CompareApplications(receipt.before, receipt.after);
-                receipt.startupEnabled = StartupManager.IsEnabled();
 
                 Report(progress, 98, "Saving receipt",
                        "Writing the complete before/after evidence.", 0, 1);
@@ -4312,6 +4661,8 @@ namespace PSPL
             }
             finally
             {
+                sampler.DurableOptimizationEnabled =
+                    DurableOptimizationManager.IsEnabled();
                 if (restoreGpuOff) sampler.GpuOn = false;
             }
         }
@@ -4417,8 +4768,8 @@ namespace PSPL
                    Math.Abs(unavailable.gpuImprovementPercent) < 0.01 &&
                    Math.Abs(worse.cpuImprovementPercent + 20) < 0.01 &&
                    legacyConflictRestored && monotonic &&
-                   PersistenceScope.IndexOf("manually running",
-                       StringComparison.OrdinalIgnoreCase) >= 0 &&
+                   PersistenceScope.IndexOf("after every Windows sign-in",
+                        StringComparison.OrdinalIgnoreCase) >= 0 &&
                    TpuStatus.IndexOf("does not fabricate",
                        StringComparison.OrdinalIgnoreCase) >= 0;
         }
@@ -5003,6 +5354,10 @@ namespace PSPL
                     receipt.restoredLegacyPolicies);
                 text.AppendLine("Windows startup: " +
                     (receipt.startupEnabled ? "enabled" : "off"));
+                text.AppendLine("Durable optimization: " +
+                    (receipt.durableOptimizationEnabled
+                        ? "enabled and re-evaluated automatically"
+                        : "not verified"));
                 text.AppendLine();
                 text.AppendLine(receipt.persistenceScope);
                 text.AppendLine(receipt.tpuStatus);
@@ -5277,6 +5632,13 @@ namespace PSPL
             _sampler.Rules = RulesStore.Load();
             _sampler.ProBalance = enableEnforcement;
             _sampler.EnforcementEnabled = enableEnforcement;
+            DurableOptimizationSettings durableSettings =
+                DurableOptimizationStore.Load();
+            _sampler.DurableOptimizationEnabled =
+                enableEnforcement && durableSettings.enabled;
+            _sampler.DurableOptimizationIntervalMs =
+                DurableOptimizationStore.NormalizeInterval(
+                    durableSettings.intervalSeconds) * 1000;
             _sampler.Start();   // begin sampling immediately so data is ready while the UI builds
             Text = "PSProcLasso — Real-Time System Monitor";
             try { Icon = TrayIcon(); } catch { }   // custom window icon (same art as the tray)
@@ -5471,22 +5833,26 @@ namespace PSPL
             gpu.CheckedChanged += (s, e) => _sampler.GpuOn = gpu.Checked;
             _trayMenu.Items.Add(gpu);
 
-            var startup = new ToolStripMenuItem("Start silently with Windows")
+            var startup = new ToolStripMenuItem(
+                "Keep safe optimization active after sign-in")
             {
-                Checked = StartupManager.IsEnabled()
+                Checked = DurableOptimizationManager.IsEnabled()
             };
             startup.ForeColor = Theme.Text;
             startup.Click += (s, e) =>
             {
                 string error;
-                bool wanted = !StartupManager.IsEnabled();
-                bool ok = wanted ? StartupManager.Enable(out error) : StartupManager.Disable(out error);
-                startup.Checked = StartupManager.IsEnabled();
+                bool wanted = !DurableOptimizationManager.IsEnabled();
+                bool ok = wanted
+                    ? DurableOptimizationManager.Enable(out error)
+                    : DurableOptimizationManager.Disable(out error);
+                startup.Checked = DurableOptimizationManager.IsEnabled();
+                _sampler.DurableOptimizationEnabled = startup.Checked;
                 if (!ok) new DarkBox("Windows startup", error, false).ShowDialog(this);
                 else _tray.ShowBalloonTip(1800, "PSProcLasso",
                     startup.Checked
-                        ? "Silent rule enforcement will start automatically after every Windows sign-in."
-                        : "Automatic Windows startup is off.",
+                        ? "Safe optimization will be re-evaluated silently after every Windows sign-in."
+                        : "Automatic optimization and Windows startup are off.",
                     ToolTipIcon.Info);
             };
             _trayMenu.Items.Add(startup);
@@ -5648,7 +6014,8 @@ namespace PSPL
             foreach (ToolStripItem item in _trayMenu.Items)
             {
                 var menu = item as ToolStripMenuItem;
-                if (menu != null && menu.Text == "Start silently with Windows")
+                if (menu != null &&
+                    menu.Text == "Keep safe optimization active after sign-in")
                     return menu.Checked;
             }
             return true;
@@ -6077,7 +6444,8 @@ namespace PSPL
             if (_optimizationRunning) return;
             string message =
                 "Measure a stable baseline, review every observed process, remove the older " +
-                "conflicting app-owned boost policy, and apply only reversible safe changes?\n\n" +
+                "conflicting app-owned boost policy, apply only reversible safe changes, and " +
+                "keep them active through a hidden least-privilege sign-in task?\n\n" +
                 "No process will be closed. RAM will not be force-trimmed, GPU will not be " +
                 "suspended, and critical, visible, AI, and externally managed processes stay protected.";
             if (new DarkBox("Measured safe optimization", message, true).ShowDialog(this) !=
@@ -7131,7 +7499,7 @@ namespace PSPL
                       "CPU and RAM use Windows Job Object hard caps when the target permits\n" +
                       "assignment, with clearly reported fallbacks otherwise. GPU duty limiting\n" +
                       "uses rapid suspend/resume and therefore limits the whole app while active.\n" +
-                      "Start silently with Windows is available from the tray menu; it uses a\n" +
+                      "Durable safe optimization is available from the tray menu; it uses a\n" +
                       "hidden least-privilege logon task, so no terminal window appears and\n" +
                       "user-writable rules never become an elevation path.\n" +
                       "Protected/system processes may still be refused by Windows; every refusal\n" +
@@ -7419,16 +7787,22 @@ namespace PSPL
                 long x = 1;
                 while (true) x = unchecked(x * 1664525 + 1013904223);
             }
-            if (args.Length > 0 && args[0] == "--install-startup")
+            if (args.Length > 0 &&
+                (args[0] == "--install-startup" ||
+                 args[0] == "--enable-durable-optimization"))
             {
                 string error;
-                Environment.ExitCode = StartupManager.Enable(out error) ? 0 : 1;
+                Environment.ExitCode =
+                    DurableOptimizationManager.Enable(out error) ? 0 : 1;
                 return;
             }
-            if (args.Length > 0 && args[0] == "--remove-startup")
+            if (args.Length > 0 &&
+                (args[0] == "--remove-startup" ||
+                 args[0] == "--disable-durable-optimization"))
             {
                 string error;
-                Environment.ExitCode = StartupManager.Disable(out error) ? 0 : 1;
+                Environment.ExitCode =
+                    DurableOptimizationManager.Disable(out error) ? 0 : 1;
                 return;
             }
             if (args.Length > 0 && args[0] == "--enforcementcheck")
@@ -8753,7 +9127,8 @@ namespace PSPL
                 string[] menu = f.TrayMenuTextsForTest();
                 log.AppendLine("tray menu: " + string.Join("  |  ", menu));
                 bool startupMenuChecked = f.StartupMenuCheckedForTest();
-                bool startupMenuAccurate = startupMenuChecked == StartupManager.IsEnabled();
+                bool startupMenuAccurate =
+                    startupMenuChecked == DurableOptimizationManager.IsEnabled();
                 log.AppendLine("startup menu checked=" + startupMenuChecked +
                                " matches scheduler=" + startupMenuAccurate);
                 // Drive the list through both render paths (stable in-place updates and
@@ -9023,7 +9398,12 @@ namespace PSPL
                 bool legacyBoostIsolationSafety =
                     Sampler.VerifyLegacyBoostIsolationContract();
                 bool startupPrivilegeSafety = StartupManager.VerifyLeastPrivilegeContract();
+                bool popupFreeStartupSafety = StartupManager.VerifyPopupFreeContract();
                 bool startupDisabledStateSafety = StartupManager.VerifyDisabledStateContract();
+                bool durableOptimizationSettingsSafety =
+                    DurableOptimizationStore.VerifyContract();
+                bool durableOptimizationCadenceSafety =
+                    Sampler.VerifyDurableOptimizationContract();
                 bool concurrentRuleSafety = RulesStore.VerifyConcurrentMutationContract();
                 bool backupRuleSafety = RulesStore.VerifyBackupRecoveryContract();
                 bool recoveryBudgetSafety = VerifyBackgroundRecoveryBudgetContract();
@@ -9051,7 +9431,12 @@ namespace PSPL
                 log.AppendLine("resource release safety=" + resourceReleaseSafety);
                 log.AppendLine("legacy boost isolation=" + legacyBoostIsolationSafety);
                 log.AppendLine("startup least-privilege safety=" + startupPrivilegeSafety);
+                log.AppendLine("startup popup-free safety=" + popupFreeStartupSafety);
                 log.AppendLine("startup disabled-state safety=" + startupDisabledStateSafety);
+                log.AppendLine("durable optimization settings=" +
+                               durableOptimizationSettingsSafety);
+                log.AppendLine("durable optimization cadence=" +
+                               durableOptimizationCadenceSafety);
                 log.AppendLine("concurrent rule mutation safety=" + concurrentRuleSafety);
                 log.AppendLine("rules backup recovery safety=" + backupRuleSafety);
                 log.AppendLine("background recovery budget safety=" + recoveryBudgetSafety);
@@ -9121,10 +9506,13 @@ namespace PSPL
                 log.AppendLine(errs.Count == 0 && ready && atomicGpuPublication && pidSafeCpuDelta &&
                                 cpuReadFailureRecovery && gpuCounterFailureIsolation && gpuWarmupSafety &&
                                 gpuFreshnessSafety
-                                 && processIdentitySafety && nativeStatusSafety && resourceReleaseSafety
-                                 && legacyBoostIsolationSafety
-                                 && startupPrivilegeSafety && startupDisabledStateSafety &&
-                                 concurrentRuleSafety && backupRuleSafety
+                                  && processIdentitySafety && nativeStatusSafety && resourceReleaseSafety
+                                  && legacyBoostIsolationSafety
+                                  && startupPrivilegeSafety && popupFreeStartupSafety &&
+                                  startupDisabledStateSafety &&
+                                  durableOptimizationSettingsSafety &&
+                                  durableOptimizationCadenceSafety &&
+                                  concurrentRuleSafety && backupRuleSafety
                                 && recoveryBudgetSafety && searchFilterSafety && processViewSafety &&
                                 unavailableGpuRenderingSafety && calmRefreshCadenceSafety &&
                                 optimizerPolicySafety && optimizerWorkflowSafety &&

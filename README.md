@@ -4,6 +4,14 @@ A native Windows real-time system monitor and process manager with an optional
 PowerShell terminal edition. The included `PSProcLassoGUI.exe` is ready to run;
 its complete WinForms source is in `PSProcLassoGUI.cs`.
 
+## Install
+
+Download `PSProcLassoSetup-1.1.0.exe` from the latest GitHub Release. The
+per-user installer needs no administrator prompt, adds a Start Menu shortcut,
+and enables the hidden safe optimizer after sign-in by default. The same
+release also includes a portable `PSProcLassoGUI-1.1.0-portable.exe` and
+SHA-256 checksums for both executables.
+
 It shows every running process with live **CPU %, RAM working set, GPU engine %,
 and dedicated VRAM**, ranked by the resource you select. The default one-PID
 view is directly comparable with Process Lasso and Task Manager; an optional
@@ -11,13 +19,13 @@ view is directly comparable with Process Lasso and Task Manager; an optional
 The GUI uses stable in-place rows and double buffering, so live updates remain
 calm instead of blinking.
 
-The adaptive performance mode continuously measures the 20 heaviest application
-groups by CPU, RAM, and GPU, removes app-owned resource caps, expands safe
-workloads to all logical processors, disables execution-speed throttling where
-Windows permits it, and preserves protected Windows scheduling decisions.
+The measured safe optimizer reviews every observed process, protects critical,
+visible, AI-session, and externally managed applications, and applies only
+conservative reversible scheduling changes. It can keep that policy active
+after sign-in through a hidden least-privilege background enforcer.
 
 ```
-PSProcLasso v1.0  |  CPU 23.4%  RAM 8.1/16.0 GB (51%)  GPU 12.0%  VRAM 1.2/8.0 GB  |  14:30:22
+PSProcLasso v1.1  |  CPU 23.4%  RAM 8.1/16.0 GB (51%)  GPU 12.0%  VRAM 1.2/8.0 GB  |  14:30:22
 Available RAM: 7.9 GB   Standby cache: 2.3 GB   ProBalance: ON   GPU sampling: ON   Filter: (none)   Sort: CPU
     PID      NAME                      CPU%     MEMORY     GPU%        VRAM    PRIORITY      AFFINITY
    1234  chrome                       12.3   1.2 GB      3.4    512 MB      Normal       0,1,2,3,4,5
@@ -99,7 +107,8 @@ What you get:
   with separate signed CPU, RAM, and GPU before/after percentages. Increased load is
   reported as increased; unavailable GPU data is not converted to a fake zero. The full
   per-application evidence is saved to
-  `%USERPROFILE%\.psproclasso\last-optimization.json`.
+  `%USERPROFILE%\.psproclasso\last-optimization.json`. A successful run also
+  enables popup-free safe re-evaluation after each Windows sign-in.
 * The optimizer never terminates a process, never force-trims RAM, never duty-cycles GPU,
   never applies High or Realtime priority, and never restricts affinity. Windows-critical
   and Session 0 processes, visible/foreground applications, AI-session infrastructure,
@@ -132,14 +141,13 @@ What you get:
   (cap the top CPU/GPU process at 50%, trim the top RAM process, remove limits), per-rule
   **Watchdog on/off**, **ProBalance** and **GPU sampling** toggles, and a real **Exit**.
   Double-click the tray icon to restore the window.
-* **Optional silent persistence after Windows restart** — off unless manually enabled
-  from the tray menu. When enabled, it installs a hidden,
-  least-privilege logon task. It starts the GUI binary in background mode with no
-  terminal window, applies saved rules to every matching process instance, and ignores
-  duplicate launches while allowing a normal launch to reveal the existing window.
-  Least privilege prevents user-writable rules or binaries from becoming an elevation path.
-  With startup off, optimizer rules remain saved and are re-applied whenever PSProcLasso
-  is manually running; the optimizer does not silently re-enable startup.
+* **Durable popup-free optimization** — clicking **OPTIMIZE**, selecting the tray
+  persistence option, or accepting the installer's default background option creates
+  a hidden least-privilege logon task. It launches the GUI binary directly in background
+  mode, never through PowerShell or `cmd.exe`, periodically re-evaluates the same
+  conservative optimizer policy, applies saved rules to matching process instances,
+  and ignores duplicate launches. Turning the tray option off or uninstalling removes
+  the scheduled task and disables automatic optimization.
 * Persistent rules shared with the TUI. Concurrent GUI/background updates are serialized,
   writes are atomic, and a last-known-good backup repairs a missing or corrupt primary
   rules file without losing independent rule changes.
@@ -157,6 +165,17 @@ Build it yourself (only needed if you edit `PSProcLassoGUI.cs`):
   -r:System.Management.dll -r:System.Web.Extensions.dll `
   PSProcLassoGUI.cs
 ```
+
+Build the installer after compiling the executable:
+
+```powershell
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" .\installer\PSProcLasso.iss
+```
+
+The installer is written to `dist\PSProcLassoSetup-1.1.0.exe`. It installs per
+user without an administrator prompt, creates Start Menu shortcuts, does not
+open the monitor automatically, and uses direct hidden executable actions for
+startup setup and removal.
 
 Sanity checks (all headless, all print `RESULT: OK` with zero exceptions):
 

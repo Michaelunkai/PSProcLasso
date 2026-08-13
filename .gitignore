@@ -11,3 +11,4 @@ PSProcLassoGUI.top20-*.exe
 *.tmp
 bin/
 obj/
+dist/
