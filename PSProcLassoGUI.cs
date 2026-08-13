@@ -283,9 +283,15 @@ namespace PSPL
         public string executablePath { get; set; }
         public double cpuPercent { get; set; }
         public long ramBytes { get; set; }
+        public double gpuPercent { get; set; }
+        public bool gpuValid { get; set; }
+        public long vramBytes { get; set; }
         public string currentPriority { get; set; }
         public string action { get; set; }
         public string targetPriority { get; set; }
+        public string cpuAction { get; set; }
+        public string ramAction { get; set; }
+        public string gpuAction { get; set; }
         public string reason { get; set; }
         public bool persistent { get; set; }
         public bool applied { get; set; }
@@ -304,9 +310,98 @@ namespace PSPL
         public int processCount { get; set; }
         public int changedProcesses { get; set; }
         public int persistentRules { get; set; }
+        public int restoredLegacyPolicies { get; set; }
         public int failedChanges { get; set; }
         public List<OptimizationDecision> decisions { get; set; }
         public List<string> errors { get; set; }
+    }
+
+    internal class ResourceMeasurement
+    {
+        public int samples { get; set; }
+        public int gpuSamples { get; set; }
+        public long durationMs { get; set; }
+        public double cpuPercent { get; set; }
+        public long ramUsedBytes { get; set; }
+        public long ramTotalBytes { get; set; }
+        public double ramPercent { get; set; }
+        public double gpuPercent { get; set; }
+        public bool gpuValid { get; set; }
+        public double cpuSpread { get; set; }
+        public double ramSpreadPercent { get; set; }
+        public double gpuSpread { get; set; }
+        public List<ApplicationMeasurement> applications { get; set; }
+    }
+
+    internal class ApplicationMeasurement
+    {
+        public string key { get; set; }
+        public string name { get; set; }
+        public int samples { get; set; }
+        public int gpuSamples { get; set; }
+        public double cpuPercent { get; set; }
+        public long ramBytes { get; set; }
+        public double gpuPercent { get; set; }
+        public bool gpuValid { get; set; }
+        public long vramBytes { get; set; }
+    }
+
+    internal class OptimizationImpact
+    {
+        public double cpuChangePoints { get; set; }
+        public double cpuImprovementPercent { get; set; }
+        public long ramChangeBytes { get; set; }
+        public double ramChangePoints { get; set; }
+        public double ramImprovementPercent { get; set; }
+        public bool gpuMeasured { get; set; }
+        public double gpuChangePoints { get; set; }
+        public double gpuImprovementPercent { get; set; }
+        public string confidence { get; set; }
+        public string interpretation { get; set; }
+    }
+
+    internal class ApplicationImpact
+    {
+        public string key { get; set; }
+        public string name { get; set; }
+        public string status { get; set; }
+        public double cpuBeforePercent { get; set; }
+        public double cpuAfterPercent { get; set; }
+        public double cpuImprovementPercent { get; set; }
+        public long ramBeforeBytes { get; set; }
+        public long ramAfterBytes { get; set; }
+        public double ramImprovementPercent { get; set; }
+        public bool gpuMeasured { get; set; }
+        public double gpuBeforePercent { get; set; }
+        public double gpuAfterPercent { get; set; }
+        public double gpuImprovementPercent { get; set; }
+    }
+
+    internal class OptimizationRunReceipt
+    {
+        public string schema { get; set; }
+        public string generatedUtc { get; set; }
+        public string machine { get; set; }
+        public ResourceMeasurement before { get; set; }
+        public ResourceMeasurement after { get; set; }
+        public OptimizationImpact systemImpact { get; set; }
+        public List<ApplicationImpact> applications { get; set; }
+        public OptimizationReceipt actions { get; set; }
+        public int restoredLegacyPolicies { get; set; }
+        public bool startupEnabled { get; set; }
+        public string persistenceScope { get; set; }
+        public string tpuStatus { get; set; }
+        public string receiptPath { get; set; }
+        public List<string> errors { get; set; }
+    }
+
+    internal class OptimizationProgress
+    {
+        public int percent { get; set; }
+        public string phase { get; set; }
+        public string message { get; set; }
+        public int current { get; set; }
+        public int total { get; set; }
     }
 
     internal class AdaptiveTop20Decision
@@ -771,7 +866,10 @@ namespace PSPL
         public volatile bool GpuOn = true;
         public volatile bool ProBalance = true;
         public volatile bool EnforcementEnabled = true;
-        public volatile bool AdaptiveTop20Enabled = true;
+        // Legacy top-20 boosting is opt-in through its explicit CLI command. Running it
+        // continuously could promote a background worker that the safe optimizer had
+        // just deprioritized, so the normal GUI uses one coherent policy instead.
+        public volatile bool AdaptiveTop20Enabled = false;
 
         public ConcurrentDictionary<string, Rule> Rules;
         public ConcurrentDictionary<int, GpuLimitState> GpuLimits = new ConcurrentDictionary<int, GpuLimitState>();
@@ -1790,7 +1888,8 @@ namespace PSPL
             {
                 currentPids.Add(row.Id);
                 Rule rule;
-                if (!Rules.TryGetValue(row.Name, out rule) || !rule.enabled) continue;
+                if (!Rules.TryGetValue(row.Name, out rule) ||
+                    !RuleAppliesInCurrentMode(rule, AdaptiveTop20Enabled)) continue;
                 Process p;
                 if (!TryGetProc(row.Id, out p)) continue;
                 try
@@ -1799,12 +1898,10 @@ namespace PSPL
                     try { identity = p.StartTime.ToUniversalTime().Ticks; }
                     catch { identity = row.Id; }
                     long appliedIdentity;
-                    bool performancePriorityDrift = rule.performanceManaged &&
-                        !String.IsNullOrWhiteSpace(rule.priority) &&
-                        !String.Equals(row.Priority ?? "", rule.priority,
-                                       StringComparison.OrdinalIgnoreCase);
+                    bool managedPriorityDrift =
+                        ManagedPriorityNeedsReapply(rule, row.Priority);
                     if (_ruleAppliedPids.TryGetValue(row.Id, out appliedIdentity) &&
-                        appliedIdentity == identity && !performancePriorityDrift) continue;
+                        appliedIdentity == identity && !managedPriorityDrift) continue;
                     ApplyRuleToProcess(p, rule);
                     _ruleAppliedPids[row.Id] = identity;
                 }
@@ -1815,6 +1912,41 @@ namespace PSPL
                 if (!currentPids.Contains(pid)) _ruleAppliedPids.Remove(pid);
             foreach (int pid in ResourceJobs.Keys.ToList())
                 if (!currentPids.Contains(pid)) CloseResourceJob(pid);
+        }
+
+        internal static bool RuleAppliesInCurrentMode(Rule rule,
+                                                      bool adaptiveTop20Enabled)
+        {
+            return rule != null && rule.enabled &&
+                   (!rule.performanceManaged || adaptiveTop20Enabled);
+        }
+
+        internal static bool ManagedPriorityNeedsReapply(Rule rule,
+                                                         string currentPriority)
+        {
+            return rule != null &&
+                   (rule.optimizerManaged || rule.performanceManaged) &&
+                   !String.IsNullOrWhiteSpace(rule.priority) &&
+                   !String.Equals(currentPriority ?? "", rule.priority,
+                                  StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static bool VerifyLegacyBoostIsolationContract()
+        {
+            Rule ordinary = Rule.New();
+            ordinary.priority = "BelowNormal";
+            Rule legacyBoost = Rule.New();
+            legacyBoost.priority = "AboveNormal";
+            legacyBoost.performanceManaged = true;
+            Rule disabled = Rule.New();
+            disabled.enabled = false;
+            return RuleAppliesInCurrentMode(ordinary, false) &&
+                   !RuleAppliesInCurrentMode(legacyBoost, false) &&
+                   RuleAppliesInCurrentMode(legacyBoost, true) &&
+                   ManagedPriorityNeedsReapply(legacyBoost, "Normal") &&
+                   !ManagedPriorityNeedsReapply(legacyBoost, "AboveNormal") &&
+                   !RuleAppliesInCurrentMode(disabled, true) &&
+                   !RuleAppliesInCurrentMode(null, true);
         }
 
         public void ApplyRuleToProcess(Process p, Rule rule)
@@ -2411,6 +2543,64 @@ namespace PSPL
                 AddError("Top20 restore for " + row.Name + ": " + ex.Message);
             }
             finally { process.Dispose(); }
+        }
+
+        public int RestoreLegacyPerformancePolicies(out List<string> errors)
+        {
+            errors = new List<string>();
+            AdaptiveTop20Enabled = false;
+            var restoredByName =
+                new Dictionary<string, Rule>(StringComparer.OrdinalIgnoreCase);
+            ConcurrentDictionary<string, Rule> latest;
+            string error;
+            int restoredCount = 0;
+            bool saved = RulesStore.MutateRules(dict =>
+            {
+                foreach (var kv in dict.ToList())
+                {
+                    Rule rule = kv.Value;
+                    if (rule == null || !rule.performanceManaged) continue;
+                    Rule restored = Rule.New();
+                    restored.priority = rule.performanceOriginalPriority ?? "";
+                    restored.affinity = rule.performanceOriginalAffinity == null
+                        ? new int[0] : rule.performanceOriginalAffinity.ToArray();
+                    restored.cpuLimit = rule.performanceOriginalCpuLimit;
+                    restored.gpuLimit = rule.performanceOriginalGpuLimit;
+                    restored.ramLimit = rule.performanceOriginalRamLimit;
+                    restored.enabled = true;
+                    restoredByName[kv.Key] = restored;
+                    if (!AdaptiveTop20Optimizer.RestorePerformanceRule(rule)) continue;
+                    restoredCount++;
+                    if (AdaptiveTop20Optimizer.IsEmptyRule(rule))
+                    {
+                        Rule ignored;
+                        dict.TryRemove(kv.Key, out ignored);
+                    }
+                    else dict[kv.Key] = rule;
+                }
+            }, out latest, out error);
+            if (!saved)
+            {
+                errors.Add("Could not restore older adaptive policies: " + error);
+                return 0;
+            }
+
+            Rules = latest;
+            foreach (var row in (Snap == null ? new List<ProcRow>() : Snap.Rows))
+            {
+                Rule restored;
+                if (!restoredByName.TryGetValue(row.Name, out restored)) continue;
+                try { RestoreLivePerformanceRule(row, restored); }
+                catch (Exception ex)
+                {
+                    errors.Add(row.Name + " PID " + row.Id + ": " + ex.Message);
+                }
+            }
+            AdaptiveTop20Pids.Clear();
+            _adaptiveApplicationLastSeen.Clear();
+            _adaptiveApplicationMetrics.Clear();
+            _adaptiveRuleFingerprint = "";
+            return restoredCount;
         }
 
         private void StepAdaptiveTop20()
@@ -3274,9 +3464,18 @@ namespace PSPL
                 executablePath = row == null ? "" : (row.ExecutablePath ?? ""),
                 cpuPercent = row == null ? 0 : row.Cpu,
                 ramBytes = row == null ? 0 : row.Mem,
+                gpuPercent = row == null ? 0 : row.Gpu,
+                gpuValid = row != null && row.GpuValid,
+                vramBytes = row == null ? 0 : row.Vram,
                 currentPriority = row == null ? "" : (row.Priority ?? ""),
                 action = action,
                 targetPriority = target,
+                cpuAction = String.IsNullOrWhiteSpace(target)
+                    ? "observe and preserve" : "set " + target + " priority",
+                ramAction = "measure only; Windows manages working sets",
+                gpuAction = row != null && row.GpuValid
+                    ? "measure only; no unsafe duty-cycle throttle"
+                    : "GPU telemetry unavailable; no value fabricated",
                 reason = reason,
                 persistent = persistent,
                 applied = false,
@@ -3432,7 +3631,26 @@ namespace PSPL
             return 0;
         }
 
-        internal static OptimizationReceipt Execute(Snapshot snapshot, string mode)
+        private static void Report(Action<OptimizationProgress> progress, int percent,
+                                   string phase, string message, int current, int total)
+        {
+            if (progress == null) return;
+            try
+            {
+                progress(new OptimizationProgress
+                {
+                    percent = Math.Max(0, Math.Min(100, percent)),
+                    phase = phase ?? "",
+                    message = message ?? "",
+                    current = Math.Max(0, current),
+                    total = Math.Max(0, total)
+                });
+            }
+            catch { }
+        }
+
+        internal static OptimizationReceipt Execute(
+            Snapshot snapshot, string mode, Action<OptimizationProgress> progress = null)
         {
             if (snapshot == null) snapshot = new Snapshot();
             var rules = RulesStore.Load();
@@ -3451,9 +3669,13 @@ namespace PSPL
                 decisions = new List<OptimizationDecision>(),
                 errors = new List<string>()
             };
+            int rowCount = snapshot.Rows == null ? 0 : snapshot.Rows.Count;
+            Report(progress, 0, "Reviewing processes",
+                   "Building a safe decision for every observed process.", 0, rowCount);
 
             if (String.Equals(mode, "restore", StringComparison.OrdinalIgnoreCase))
             {
+                int reviewed = 0;
                 foreach (var row in snapshot.Rows ?? new List<ProcRow>())
                 {
                     Rule rule;
@@ -3465,12 +3687,24 @@ namespace PSPL
                     else
                         receipt.decisions.Add(Decision(row, "preserve", "",
                             "no optimizer-managed priority", false));
+                    reviewed++;
+                    Report(progress, rowCount == 0 ? 50 : reviewed * 50 / rowCount,
+                           "Reviewing restore plan", row.Name + " PID " + row.Id,
+                           reviewed, rowCount);
                 }
 
-                foreach (var decision in receipt.decisions.Where(x => x.action == "restore_managed"))
+                var restoreDecisions =
+                    receipt.decisions.Where(x => x.action == "restore_managed").ToList();
+                int restoredIndex = 0;
+                foreach (var decision in restoreDecisions)
                 {
                     if (ApplyPriority(decision, decision.targetPriority)) receipt.changedProcesses++;
                     else { receipt.failedChanges++; receipt.errors.Add(decision.processName + ": " + decision.error); }
+                    restoredIndex++;
+                    Report(progress, 50 + (restoreDecisions.Count == 0 ? 40 :
+                           restoredIndex * 40 / restoreDecisions.Count),
+                           "Restoring priorities", decision.displayName + " PID " + decision.pid,
+                           restoredIndex, restoreDecisions.Count);
                 }
 
                 ConcurrentDictionary<string, Rule> restored;
@@ -3483,15 +3717,31 @@ namespace PSPL
                     receipt.failedChanges++;
                     receipt.errors.Add("rules restore: " + restoreError);
                 }
+                Report(progress, 100, "Restore complete",
+                       "Optimizer-owned priorities were restored.", rowCount, rowCount);
                 return receipt;
             }
 
+            int classified = 0;
             foreach (var row in snapshot.Rows ?? new List<ProcRow>())
+            {
                 receipt.decisions.Add(Decide(row, snapshot.TotalCpu, foregroundPid, rules, selfPid));
+                classified++;
+                Report(progress, rowCount == 0 ? 45 : classified * 45 / rowCount,
+                       "Reviewing processes", row.Name + " PID " + row.Id,
+                       classified, rowCount);
+            }
 
             if (!String.Equals(mode, "apply", StringComparison.OrdinalIgnoreCase))
+            {
+                Report(progress, 100, "Plan complete",
+                       "Every observed process has an explicit decision.", rowCount, rowCount);
                 return receipt;
+            }
 
+            var changes = receipt.decisions.Where(x =>
+                x.action == "lower_now" || x.action == "lower_and_persist").ToList();
+            int changeIndex = 0;
             foreach (var decision in receipt.decisions)
             {
                 if (decision.action != "lower_now" &&
@@ -3503,6 +3753,12 @@ namespace PSPL
                     receipt.errors.Add(decision.processName + " PID " + decision.pid +
                                        ": " + decision.error);
                 }
+                changeIndex++;
+                Report(progress, 45 + (changes.Count == 0 ? 25 :
+                       changeIndex * 25 / changes.Count),
+                       "Applying reversible CPU policy",
+                       decision.displayName + " PID " + decision.pid,
+                       changeIndex, changes.Count);
             }
 
             var persistent = receipt.decisions.Where(x =>
@@ -3523,6 +3779,8 @@ namespace PSPL
                 .Select(x => x.First()).ToList();
             if (persistent.Count > 0)
             {
+                Report(progress, 75, "Saving policy",
+                       "Writing reversible rules atomically.", 0, persistent.Count);
                 ConcurrentDictionary<string, Rule> latest;
                 string error;
                 bool saved = RulesStore.MutateRules(dict =>
@@ -3545,6 +3803,8 @@ namespace PSPL
                     receipt.errors.Add("rules persistence: " + error);
                 }
             }
+            Report(progress, 100, "Policy applied",
+                   "Safe process review and persistence finished.", rowCount, rowCount);
             return receipt;
         }
 
@@ -3694,6 +3954,476 @@ namespace PSPL
         }
     }
 
+    internal static class OptimizationWorkflow
+    {
+        private sealed class ApplicationAccumulator
+        {
+            public string Key;
+            public string Name;
+            public int Samples;
+            public int GpuSamples;
+            public double CpuTotal;
+            public double RamTotal;
+            public double GpuTotal;
+            public double VramTotal;
+        }
+
+        internal const string PersistenceScope =
+            "Saved rules are re-applied to matching processes whenever PSProcLasso is " +
+            "manually running. Windows startup remains unchanged.";
+        internal const string TpuStatus =
+            "Windows exposes no general per-process TPU utilization counter; PSProcLasso " +
+            "does not fabricate a TPU percentage.";
+
+        internal static string DefaultReceiptPath
+        {
+            get
+            {
+                return Path.Combine(Path.GetDirectoryName(RulesStore.FilePath),
+                                    "last-optimization.json");
+            }
+        }
+
+        private static void Report(Action<OptimizationProgress> progress, int percent,
+                                   string phase, string message, int current, int total)
+        {
+            if (progress == null) return;
+            try
+            {
+                progress(new OptimizationProgress
+                {
+                    percent = Math.Max(0, Math.Min(100, percent)),
+                    phase = phase ?? "",
+                    message = message ?? "",
+                    current = Math.Max(0, current),
+                    total = Math.Max(0, total)
+                });
+            }
+            catch { }
+        }
+
+        internal static int StageProgress(int start, int span, int current, int total)
+        {
+            if (total <= 0) return Math.Max(0, Math.Min(100, start));
+            double fraction = Math.Max(0, Math.Min(1, current / (double)total));
+            return Math.Max(0, Math.Min(100,
+                start + (int)Math.Round(span * fraction)));
+        }
+
+        private static double Average(IEnumerable<double> values)
+        {
+            double[] data = values == null ? new double[0] : values.ToArray();
+            return data.Length == 0 ? 0 : data.Average();
+        }
+
+        private static double Spread(IEnumerable<double> values)
+        {
+            double[] data = values == null ? new double[0] : values.ToArray();
+            if (data.Length < 2) return 0;
+            double average = data.Average();
+            return Math.Sqrt(data.Sum(x => (x - average) * (x - average)) / data.Length);
+        }
+
+        internal static ResourceMeasurement Summarize(
+            IEnumerable<Snapshot> source, long durationMs)
+        {
+            var snapshots = (source ?? Enumerable.Empty<Snapshot>())
+                .Where(x => x != null).ToList();
+            var cpu = snapshots.Select(x => Math.Max(0, Math.Min(100, x.TotalCpu))).ToArray();
+            var ramBytes = snapshots.Select(x => Math.Max(0, x.RamUsed)).ToArray();
+            var ramPercent = snapshots.Select(x => x.RamTotal <= 0 ? 0 :
+                Math.Max(0, Math.Min(100, x.RamUsed * 100.0 / x.RamTotal))).ToArray();
+            var gpu = snapshots.Where(x => x.GpuValid)
+                .Select(x => Math.Max(0, Math.Min(100, x.GpuPct))).ToArray();
+            var apps =
+                new Dictionary<string, ApplicationAccumulator>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var snapshot in snapshots)
+            {
+                foreach (var row in MainForm.BuildApplicationRows(snapshot.Rows))
+                {
+                    string key = String.IsNullOrWhiteSpace(row.GroupKey)
+                        ? row.Name : row.GroupKey;
+                    ApplicationAccumulator accumulator;
+                    if (!apps.TryGetValue(key, out accumulator))
+                    {
+                        accumulator = new ApplicationAccumulator
+                        {
+                            Key = key,
+                            Name = row.Name
+                        };
+                        apps[key] = accumulator;
+                    }
+                    accumulator.Samples++;
+                    accumulator.CpuTotal += Math.Max(0, row.Cpu);
+                    accumulator.RamTotal += Math.Max(0, row.Mem);
+                    accumulator.VramTotal += Math.Max(0, row.Vram);
+                    if (row.GpuValid)
+                    {
+                        accumulator.GpuSamples++;
+                        accumulator.GpuTotal += Math.Max(0, row.Gpu);
+                    }
+                }
+            }
+
+            long totalRam = snapshots.Select(x => x.RamTotal)
+                .Where(x => x > 0).DefaultIfEmpty(0).Max();
+            return new ResourceMeasurement
+            {
+                samples = snapshots.Count,
+                gpuSamples = gpu.Length,
+                durationMs = Math.Max(0, durationMs),
+                cpuPercent = Math.Round(Average(cpu), 2),
+                ramUsedBytes = ramBytes.Length == 0 ? 0 :
+                    (long)Math.Round(ramBytes.Average(x => (double)x)),
+                ramTotalBytes = totalRam,
+                ramPercent = Math.Round(Average(ramPercent), 2),
+                gpuPercent = Math.Round(Average(gpu), 2),
+                gpuValid = gpu.Length > 0,
+                cpuSpread = Math.Round(Spread(cpu), 2),
+                ramSpreadPercent = Math.Round(Spread(ramPercent), 2),
+                gpuSpread = Math.Round(Spread(gpu), 2),
+                applications = apps.Values.OrderByDescending(x => x.CpuTotal)
+                    .ThenBy(x => x.Name).Select(x => new ApplicationMeasurement
+                    {
+                        key = x.Key,
+                        name = x.Name,
+                        samples = x.Samples,
+                        gpuSamples = x.GpuSamples,
+                        cpuPercent = Math.Round(x.Samples == 0 ? 0 :
+                            x.CpuTotal / x.Samples, 2),
+                        ramBytes = (long)Math.Round(x.Samples == 0 ? 0 :
+                            x.RamTotal / x.Samples),
+                        gpuPercent = Math.Round(x.GpuSamples == 0 ? 0 :
+                            x.GpuTotal / x.GpuSamples, 2),
+                        gpuValid = x.GpuSamples > 0,
+                        vramBytes = (long)Math.Round(x.Samples == 0 ? 0 :
+                            x.VramTotal / x.Samples)
+                    }).ToList()
+            };
+        }
+
+        private static double RelativeImprovement(double before, double after)
+        {
+            if (before <= 0) return after <= 0 ? 0 : -100;
+            return Math.Round((before - after) * 100.0 / before, 2);
+        }
+
+        private static string Confidence(ResourceMeasurement before,
+                                         ResourceMeasurement after)
+        {
+            if (before == null || after == null ||
+                before.samples < 5 || after.samples < 5) return "low";
+            bool stableCpu = before.cpuSpread <= 7 && after.cpuSpread <= 7;
+            bool stableRam = before.ramSpreadPercent <= 1 &&
+                             after.ramSpreadPercent <= 1;
+            bool stableGpu = !before.gpuValid || !after.gpuValid ||
+                             (before.gpuSpread <= 12 && after.gpuSpread <= 12);
+            return stableCpu && stableRam && stableGpu &&
+                   before.samples >= 8 && after.samples >= 8 ? "high" : "medium";
+        }
+
+        internal static OptimizationImpact Compare(ResourceMeasurement before,
+                                                   ResourceMeasurement after)
+        {
+            before = before ?? new ResourceMeasurement();
+            after = after ?? new ResourceMeasurement();
+            bool gpuMeasured = before.gpuValid && after.gpuValid;
+            return new OptimizationImpact
+            {
+                cpuChangePoints = Math.Round(before.cpuPercent - after.cpuPercent, 2),
+                cpuImprovementPercent =
+                    RelativeImprovement(before.cpuPercent, after.cpuPercent),
+                ramChangeBytes = before.ramUsedBytes - after.ramUsedBytes,
+                ramChangePoints = Math.Round(before.ramPercent - after.ramPercent, 2),
+                ramImprovementPercent =
+                    RelativeImprovement(before.ramUsedBytes, after.ramUsedBytes),
+                gpuMeasured = gpuMeasured,
+                gpuChangePoints = gpuMeasured
+                    ? Math.Round(before.gpuPercent - after.gpuPercent, 2) : 0,
+                gpuImprovementPercent = gpuMeasured
+                    ? RelativeImprovement(before.gpuPercent, after.gpuPercent) : 0,
+                confidence = Confidence(before, after),
+                interpretation =
+                    "Positive values mean lower observed load. Negative values mean load " +
+                    "increased. Workload changes can affect the comparison, so no causal " +
+                    "improvement is claimed without stable measurements."
+            };
+        }
+
+        internal static List<ApplicationImpact> CompareApplications(
+            ResourceMeasurement before, ResourceMeasurement after)
+        {
+            var result = new List<ApplicationImpact>();
+            var beforeMap = (before == null || before.applications == null
+                    ? Enumerable.Empty<ApplicationMeasurement>() : before.applications)
+                .ToDictionary(x => x.key ?? x.name ?? "", StringComparer.OrdinalIgnoreCase);
+            var afterMap = (after == null || after.applications == null
+                    ? Enumerable.Empty<ApplicationMeasurement>() : after.applications)
+                .ToDictionary(x => x.key ?? x.name ?? "", StringComparer.OrdinalIgnoreCase);
+            var keys = new HashSet<string>(beforeMap.Keys, StringComparer.OrdinalIgnoreCase);
+            keys.UnionWith(afterMap.Keys);
+            foreach (string key in keys)
+            {
+                ApplicationMeasurement oldValue;
+                ApplicationMeasurement newValue;
+                bool hadBefore = beforeMap.TryGetValue(key, out oldValue);
+                bool hadAfter = afterMap.TryGetValue(key, out newValue);
+                oldValue = oldValue ?? new ApplicationMeasurement();
+                newValue = newValue ?? new ApplicationMeasurement();
+                bool gpuMeasured = hadBefore && hadAfter &&
+                                   oldValue.gpuValid && newValue.gpuValid;
+                result.Add(new ApplicationImpact
+                {
+                    key = key,
+                    name = hadAfter ? newValue.name : oldValue.name,
+                    status = hadBefore && hadAfter ? "comparable" :
+                             hadBefore ? "exited during measurement" :
+                             "started during measurement",
+                    cpuBeforePercent = oldValue.cpuPercent,
+                    cpuAfterPercent = newValue.cpuPercent,
+                    cpuImprovementPercent = hadBefore && hadAfter
+                        ? RelativeImprovement(oldValue.cpuPercent, newValue.cpuPercent) : 0,
+                    ramBeforeBytes = oldValue.ramBytes,
+                    ramAfterBytes = newValue.ramBytes,
+                    ramImprovementPercent = hadBefore && hadAfter
+                        ? RelativeImprovement(oldValue.ramBytes, newValue.ramBytes) : 0,
+                    gpuMeasured = gpuMeasured,
+                    gpuBeforePercent = oldValue.gpuPercent,
+                    gpuAfterPercent = newValue.gpuPercent,
+                    gpuImprovementPercent = gpuMeasured
+                        ? RelativeImprovement(oldValue.gpuPercent, newValue.gpuPercent) : 0
+                });
+            }
+            return result.OrderByDescending(x =>
+                    Math.Abs(x.cpuBeforePercent - x.cpuAfterPercent))
+                .ThenBy(x => x.name).ToList();
+        }
+
+        private static ResourceMeasurement Capture(
+            Sampler sampler, int durationMs, int progressStart, int progressSpan,
+            string phase, Action<OptimizationProgress> progress)
+        {
+            var snapshots = new List<Snapshot>();
+            var watch = Stopwatch.StartNew();
+            long lastTick = -1;
+            while (watch.ElapsedMilliseconds < durationMs)
+            {
+                long tick = sampler.FastDataTick;
+                if (tick != lastTick)
+                {
+                    Snapshot snapshot = sampler.Snap;
+                    if (snapshot != null && snapshot.ProcessCount > 0 &&
+                        snapshot.RamTotal > 0)
+                    {
+                        snapshots.Add(snapshot);
+                        lastTick = tick;
+                    }
+                }
+                int elapsed = (int)Math.Min(durationMs, watch.ElapsedMilliseconds);
+                Report(progress, StageProgress(progressStart, progressSpan,
+                       elapsed, durationMs), phase,
+                       "Collecting stable CPU, RAM, and GPU samples.",
+                       snapshots.Count, Math.Max(1, durationMs / 500));
+                Thread.Sleep(75);
+            }
+            Snapshot final = sampler.Snap;
+            if (final != null && final.ProcessCount > 0 &&
+                (snapshots.Count == 0 || sampler.FastDataTick != lastTick))
+                snapshots.Add(final);
+            return Summarize(snapshots, watch.ElapsedMilliseconds);
+        }
+
+        internal static OptimizationRunReceipt Run(
+            Sampler sampler, Action<OptimizationProgress> progress)
+        {
+            if (sampler == null) throw new ArgumentNullException("sampler");
+            var receipt = new OptimizationRunReceipt
+            {
+                schema = "psproclasso.optimization-run.v1",
+                generatedUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
+                machine = Environment.MachineName,
+                applications = new List<ApplicationImpact>(),
+                persistenceScope = PersistenceScope,
+                tpuStatus = TpuStatus,
+                receiptPath = DefaultReceiptPath,
+                errors = new List<string>()
+            };
+
+            bool restoreGpuOff = !sampler.GpuOn;
+            sampler.GpuOn = true;
+            try
+            {
+                sampler.AdaptiveTop20Enabled = false;
+                Report(progress, 0, "Preparing",
+                       "Waiting for fresh CPU, RAM, and GPU telemetry.", 0, 1);
+                var ready = Stopwatch.StartNew();
+                while (ready.ElapsedMilliseconds < 12000)
+                {
+                    bool coreReady = sampler.FastDataTick >= 3 &&
+                                     sampler.Snap.ProcessCount > 0 &&
+                                     sampler.Snap.RamTotal > 0;
+                    bool gpuReady = sampler.GpuFresh && sampler.GpuDataTick >= 2;
+                    if (coreReady && gpuReady) break;
+                    Report(progress, StageProgress(0, 2,
+                           (int)ready.ElapsedMilliseconds, 12000),
+                           "Preparing",
+                           gpuReady ? "CPU and RAM telemetry is warming up." :
+                           "GPU telemetry is initializing; no zero is being assumed.",
+                           (int)Math.Min(ready.ElapsedMilliseconds, 12000), 12000);
+                    Thread.Sleep(100);
+                }
+                if (sampler.Snap.ProcessCount <= 0 || sampler.Snap.RamTotal <= 0)
+                    throw new TimeoutException("CPU and RAM telemetry did not become ready.");
+
+                receipt.before = Capture(sampler, 6000, 2, 30,
+                                         "Measuring baseline", progress);
+                Report(progress, 33, "Reconciling policy",
+                       "Removing the older conflicting app-owned boost policy.", 0, 1);
+                List<string> restoreErrors;
+                receipt.restoredLegacyPolicies =
+                    sampler.RestoreLegacyPerformancePolicies(out restoreErrors);
+                receipt.errors.AddRange(restoreErrors);
+
+                receipt.actions = SafeOptimizer.Execute(sampler.Snap, "apply", p =>
+                    Report(progress, StageProgress(35, 30, p.percent, 100),
+                           p.phase, p.message, p.current, p.total));
+                if (receipt.actions.errors != null)
+                    receipt.errors.AddRange(receipt.actions.errors);
+                sampler.Rules = RulesStore.Load();
+
+                Report(progress, 67, "Settling",
+                       "Allowing scheduling changes to stabilize.", 0, 1);
+                Thread.Sleep(1500);
+                receipt.after = Capture(sampler, 6000, 70, 26,
+                                        "Measuring result", progress);
+                receipt.systemImpact = Compare(receipt.before, receipt.after);
+                receipt.applications = CompareApplications(receipt.before, receipt.after);
+                receipt.startupEnabled = StartupManager.IsEnabled();
+
+                Report(progress, 98, "Saving receipt",
+                       "Writing the complete before/after evidence.", 0, 1);
+                string writeError;
+                if (!AiAutomation.WriteJson(receipt.receiptPath, receipt, out writeError))
+                    receipt.errors.Add("receipt: " + writeError);
+                Report(progress, 100, "Finished",
+                       "Measured optimization is complete.", 1, 1);
+                return receipt;
+            }
+            finally
+            {
+                if (restoreGpuOff) sampler.GpuOn = false;
+            }
+        }
+
+        internal static string FormatSignedChange(double improvement)
+        {
+            if (Math.Abs(improvement) < 0.005) return "unchanged";
+            return Math.Abs(improvement).ToString("N1", CultureInfo.CurrentCulture) +
+                   "% " + (improvement > 0 ? "lower" : "higher");
+        }
+
+        internal static bool VerifyContract()
+        {
+            const long gb = 1024L * 1024 * 1024;
+            var beforeSnapshots = new List<Snapshot>();
+            var afterSnapshots = new List<Snapshot>();
+            for (int i = 0; i < 10; i++)
+            {
+                beforeSnapshots.Add(new Snapshot
+                {
+                    TotalCpu = 50,
+                    RamUsed = 50 * gb,
+                    RamTotal = 100 * gb,
+                    GpuPct = 40,
+                    GpuValid = true,
+                    ProcessCount = 1,
+                    Rows = new List<ProcRow>
+                    {
+                        new ProcRow
+                        {
+                            Id = 10, StartTicks = 100, Name = "testapp",
+                            GroupKey = "testapp", Cpu = 20, Mem = 20 * gb,
+                            Gpu = 30, GpuValid = true, Priority = "Normal",
+                            SessionId = 1
+                        }
+                    }
+                });
+                afterSnapshots.Add(new Snapshot
+                {
+                    TotalCpu = 40,
+                    RamUsed = 45 * gb,
+                    RamTotal = 100 * gb,
+                    GpuPct = 20,
+                    GpuValid = true,
+                    ProcessCount = 1,
+                    Rows = new List<ProcRow>
+                    {
+                        new ProcRow
+                        {
+                            Id = 10, StartTicks = 100, Name = "testapp",
+                            GroupKey = "testapp", Cpu = 10, Mem = 18 * gb,
+                            Gpu = 15, GpuValid = true, Priority = "Normal",
+                            SessionId = 1
+                        }
+                    }
+                });
+            }
+
+            ResourceMeasurement before = Summarize(beforeSnapshots, 6000);
+            ResourceMeasurement after = Summarize(afterSnapshots, 6000);
+            OptimizationImpact impact = Compare(before, after);
+            ApplicationImpact app = CompareApplications(before, after).Single();
+            var unavailableBefore = Summarize(new[]
+            {
+                new Snapshot
+                {
+                    TotalCpu = 50, RamUsed = 50 * gb, RamTotal = 100 * gb,
+                    GpuValid = false, ProcessCount = 1
+                }
+            }, 500);
+            OptimizationImpact unavailable = Compare(unavailableBefore, after);
+            OptimizationImpact worse = Compare(before, new ResourceMeasurement
+            {
+                samples = 10, cpuPercent = 60, ramUsedBytes = 50 * gb,
+                ramTotalBytes = 100 * gb, ramPercent = 50, gpuValid = true,
+                gpuSamples = 10, gpuPercent = 40
+            });
+            Rule combined = Rule.New();
+            combined.optimizerManaged = true;
+            combined.optimizerOriginalPriority = "";
+            combined.priority = "AboveNormal";
+            combined.performanceManaged = true;
+            combined.performanceOriginalPriority = "BelowNormal";
+            bool legacyConflictRestored =
+                AdaptiveTop20Optimizer.RestorePerformanceRule(combined) &&
+                combined.optimizerManaged && !combined.performanceManaged &&
+                combined.priority == "BelowNormal";
+            int[] progressValues = Enumerable.Range(0, 11)
+                .Select(i => StageProgress(35, 30, i, 10)).ToArray();
+            bool monotonic = progressValues.First() == 35 &&
+                             progressValues.Last() == 65 &&
+                             progressValues.Zip(progressValues.Skip(1),
+                                 (a, b) => b >= a).All(x => x);
+
+            return Math.Abs(impact.cpuImprovementPercent - 20) < 0.01 &&
+                   Math.Abs(impact.ramImprovementPercent - 10) < 0.01 &&
+                   Math.Abs(impact.gpuImprovementPercent - 50) < 0.01 &&
+                   impact.gpuMeasured && impact.confidence == "high" &&
+                   Math.Abs(app.cpuImprovementPercent - 50) < 0.01 &&
+                   Math.Abs(app.ramImprovementPercent - 10) < 0.01 &&
+                   Math.Abs(app.gpuImprovementPercent - 50) < 0.01 &&
+                   !unavailable.gpuMeasured &&
+                   Math.Abs(unavailable.gpuImprovementPercent) < 0.01 &&
+                   Math.Abs(worse.cpuImprovementPercent + 20) < 0.01 &&
+                   legacyConflictRestored && monotonic &&
+                   PersistenceScope.IndexOf("manually running",
+                       StringComparison.OrdinalIgnoreCase) >= 0 &&
+                   TpuStatus.IndexOf("does not fabricate",
+                       StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+    }
+
     internal static class AiAutomation
     {
         internal static string DefaultPath(string mode)
@@ -3792,7 +4522,7 @@ namespace PSPL
             Sampler sampler = null;
             try
             {
-                bool needGpu = mode == "snapshot";
+                bool needGpu = mode == "snapshot" || mode == "plan" || mode == "apply";
                 sampler = new Sampler
                 {
                     Rules = RulesStore.Load(),
@@ -3804,9 +4534,35 @@ namespace PSPL
                 if (!WaitForSnapshot(sampler, needGpu))
                     throw new TimeoutException("Live process sampling did not become ready.");
                 Snapshot snapshot = sampler.Snap;
-                object document = mode == "snapshot"
-                    ? SnapshotDocument(snapshot)
-                    : (object)SafeOptimizer.Execute(snapshot, mode);
+                object document;
+                if (mode == "snapshot")
+                {
+                    document = SnapshotDocument(snapshot);
+                }
+                else
+                {
+                    int restoredLegacy = 0;
+                    var restoreErrors = new List<string>();
+                    if (mode == "apply")
+                    {
+                        long beforeTick = sampler.FastDataTick;
+                        restoredLegacy =
+                            sampler.RestoreLegacyPerformancePolicies(out restoreErrors);
+                        var refresh = Stopwatch.StartNew();
+                        while (refresh.ElapsedMilliseconds < 2000 &&
+                               sampler.FastDataTick == beforeTick) Thread.Sleep(50);
+                        snapshot = sampler.Snap;
+                    }
+                    OptimizationReceipt optimization =
+                        SafeOptimizer.Execute(snapshot, mode);
+                    optimization.restoredLegacyPolicies = restoredLegacy;
+                    if (restoreErrors.Count > 0)
+                    {
+                        optimization.errors.AddRange(restoreErrors);
+                        optimization.failedChanges += restoreErrors.Count;
+                    }
+                    document = optimization;
+                }
                 string error;
                 return WriteJson(String.IsNullOrWhiteSpace(outputPath)
                     ? DefaultPath(mode) : outputPath, document, out error);
@@ -4090,6 +4846,289 @@ namespace PSPL
         }
     }
 
+    internal class OptimizationProgressForm : Form
+    {
+        private readonly Label _phase;
+        private readonly Label _message;
+        private readonly Label _count;
+        private readonly ProgressBar _progress;
+        private readonly TextBox _details;
+        private readonly Button _close;
+        private int _lastPercent;
+        private string _lastPhase = "";
+        private bool _finished;
+
+        public OptimizationProgressForm()
+        {
+            Text = "PSProcLasso - Measured Optimization";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            BackColor = Theme.Bg;
+            ForeColor = Theme.Text;
+            ClientSize = new Size(620, 390);
+            Font = new Font("Segoe UI", 9f);
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.AllPaintingInWmPaint, true);
+
+            _phase = new Label
+            {
+                Left = 18, Top = 18, Width = 584, Height = 28,
+                Text = "Preparing", Font = new Font("Segoe UI", 13f, FontStyle.Bold),
+                ForeColor = Theme.Accent, BackColor = Theme.Bg
+            };
+            _message = new Label
+            {
+                Left = 18, Top = 52, Width = 584, Height = 42,
+                Text = "Waiting for live telemetry.", ForeColor = Theme.Text,
+                BackColor = Theme.Bg
+            };
+            _progress = new ProgressBar
+            {
+                Left = 18, Top = 100, Width = 584, Height = 18,
+                Minimum = 0, Maximum = 100, Style = ProgressBarStyle.Continuous
+            };
+            _count = new Label
+            {
+                Left = 18, Top = 124, Width = 584, Height = 22,
+                Text = "0%", TextAlign = ContentAlignment.MiddleRight,
+                ForeColor = Theme.Dim, BackColor = Theme.Bg
+            };
+            _details = new TextBox
+            {
+                Left = 18, Top = 154, Width = 584, Height = 184,
+                Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
+                BorderStyle = BorderStyle.FixedSingle, BackColor = Theme.Panel,
+                ForeColor = Theme.Text, Font = new Font("Consolas", 9f)
+            };
+            _close = new Button
+            {
+                Text = "CLOSE", Left = 512, Top = 348, Width = 90, Height = 28,
+                Enabled = false, FlatStyle = FlatStyle.Flat,
+                BackColor = Theme.Panel, ForeColor = Theme.Text
+            };
+            _close.FlatAppearance.BorderColor = Theme.Header;
+            _close.Click += (s, e) => Close();
+            Controls.Add(_phase);
+            Controls.Add(_message);
+            Controls.Add(_progress);
+            Controls.Add(_count);
+            Controls.Add(_details);
+            Controls.Add(_close);
+            FormClosing += (s, e) =>
+            {
+                if (_finished) return;
+                e.Cancel = true;
+            };
+        }
+
+        public void UpdateProgress(OptimizationProgress update)
+        {
+            if (update == null || IsDisposed) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(new Action<OptimizationProgress>(UpdateProgress), update); }
+                catch { }
+                return;
+            }
+            int percent = Math.Max(_lastPercent, Math.Max(0, Math.Min(100, update.percent)));
+            _lastPercent = percent;
+            if (_progress.Value != percent) _progress.Value = percent;
+            _phase.Text = String.IsNullOrWhiteSpace(update.phase) ? "Working" : update.phase;
+            _message.Text = update.message ?? "";
+            _count.Text = percent + "%" +
+                (update.total > 0 ? "   " + update.current + " / " + update.total : "");
+            if (!String.Equals(_lastPhase, _phase.Text, StringComparison.Ordinal))
+            {
+                _lastPhase = _phase.Text;
+                _details.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " +
+                                    _phase.Text + "\r\n");
+            }
+        }
+
+        private static string MetricLine(string name, double before, double after,
+                                         double improvement)
+        {
+            return name.PadRight(4) + "  " + before.ToString("N1") + "% -> " +
+                   after.ToString("N1") + "%   (" +
+                   OptimizationWorkflow.FormatSignedChange(improvement) + ")";
+        }
+
+        public void Complete(OptimizationRunReceipt receipt)
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(new Action<OptimizationRunReceipt>(Complete), receipt); }
+                catch { }
+                return;
+            }
+            _finished = true;
+            _lastPercent = 100;
+            _progress.Value = 100;
+            _phase.Text = receipt != null && receipt.errors != null &&
+                          receipt.errors.Count > 0
+                ? "Finished with warnings" : "Optimization measured";
+            _message.Text =
+                "The result below is the observed load change, not an invented estimate.";
+            var text = new StringBuilder();
+            if (receipt == null || receipt.before == null || receipt.after == null ||
+                receipt.systemImpact == null)
+            {
+                text.AppendLine("No measurement receipt was produced.");
+            }
+            else
+            {
+                text.AppendLine(MetricLine("CPU", receipt.before.cpuPercent,
+                    receipt.after.cpuPercent, receipt.systemImpact.cpuImprovementPercent));
+                text.AppendLine(MetricLine("RAM", receipt.before.ramPercent,
+                    receipt.after.ramPercent, receipt.systemImpact.ramImprovementPercent));
+                if (receipt.systemImpact.gpuMeasured)
+                    text.AppendLine(MetricLine("GPU", receipt.before.gpuPercent,
+                        receipt.after.gpuPercent,
+                        receipt.systemImpact.gpuImprovementPercent));
+                else
+                    text.AppendLine("GPU   unavailable in one measurement window; no 0% result fabricated");
+                text.AppendLine();
+                text.AppendLine("Confidence: " + receipt.systemImpact.confidence);
+                text.AppendLine("Processes reviewed: " +
+                    (receipt.actions == null ? 0 : receipt.actions.processCount));
+                text.AppendLine("Priority changes: " +
+                    (receipt.actions == null ? 0 : receipt.actions.changedProcesses));
+                text.AppendLine("Persistent rules written: " +
+                    (receipt.actions == null ? 0 : receipt.actions.persistentRules));
+                text.AppendLine("Older conflicting policies restored: " +
+                    receipt.restoredLegacyPolicies);
+                text.AppendLine("Windows startup: " +
+                    (receipt.startupEnabled ? "enabled" : "off"));
+                text.AppendLine();
+                text.AppendLine(receipt.persistenceScope);
+                text.AppendLine(receipt.tpuStatus);
+                text.AppendLine("Receipt: " + receipt.receiptPath);
+                if (receipt.errors != null && receipt.errors.Count > 0)
+                {
+                    text.AppendLine();
+                    text.AppendLine("Warnings:");
+                    foreach (string error in receipt.errors.Take(8))
+                        text.AppendLine("  - " + error);
+                }
+            }
+            _details.Text = text.ToString();
+            _details.SelectionStart = 0;
+            _details.SelectionLength = 0;
+            _count.Text = "100%   complete";
+            _close.Enabled = true;
+            _close.Focus();
+        }
+
+        public void Fail(Exception error)
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(new Action<Exception>(Fail), error); }
+                catch { }
+                return;
+            }
+            _finished = true;
+            _phase.Text = "Optimization could not finish";
+            _message.Text = "No success percentage is shown because the measurement failed.";
+            _details.Text = error == null ? "Unknown error." : error.ToString();
+            _count.Text = _lastPercent + "%   stopped safely";
+            _close.Enabled = true;
+            _close.Focus();
+        }
+
+        private static bool RenderForContract(OptimizationProgressForm form,
+                                              string outputPath)
+        {
+            try
+            {
+                bool wasVisible = form.Visible;
+                if (!wasVisible)
+                {
+                    form.StartPosition = FormStartPosition.Manual;
+                    form.Location = new Point(-32000, -32000);
+                    form.ShowInTaskbar = false;
+                    form.Show();
+                    Application.DoEvents();
+                }
+                form.PerformLayout();
+                using (var bitmap = new Bitmap(form.Width, form.Height))
+                {
+                    form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, form.Size));
+                    int nonBackground = 0;
+                    int accentPixels = 0;
+                    for (int y = 0; y < bitmap.Height; y += 2)
+                    {
+                        for (int x = 0; x < bitmap.Width; x += 2)
+                        {
+                            Color color = bitmap.GetPixel(x, y);
+                            if (Math.Abs(color.R - Theme.Bg.R) +
+                                Math.Abs(color.G - Theme.Bg.G) +
+                                Math.Abs(color.B - Theme.Bg.B) > 18)
+                                nonBackground++;
+                            if (color.B > color.R + 20 &&
+                                color.G > color.R + 20) accentPixels++;
+                        }
+                    }
+                    bitmap.Save(outputPath, System.Drawing.Imaging.ImageFormat.Png);
+                    if (!wasVisible) form.Hide();
+                    return nonBackground > 1200 && accentPixels > 20;
+                }
+            }
+            catch { return false; }
+        }
+
+        internal static bool VerifyContract()
+        {
+            using (var form = new OptimizationProgressForm())
+            {
+                form.UpdateProgress(new OptimizationProgress
+                {
+                    percent = 25, phase = "Baseline", message = "sample", current = 2, total = 10
+                });
+                form.UpdateProgress(new OptimizationProgress
+                {
+                    percent = 10, phase = "Older update", message = "late", current = 1, total = 10
+                });
+                bool monotonic = form._progress.Value == 25;
+                form.Complete(new OptimizationRunReceipt
+                {
+                    before = new ResourceMeasurement
+                    {
+                        cpuPercent = 50, ramPercent = 50, gpuPercent = 40, gpuValid = true
+                    },
+                    after = new ResourceMeasurement
+                    {
+                        cpuPercent = 40, ramPercent = 45, gpuPercent = 20, gpuValid = true
+                    },
+                    systemImpact = new OptimizationImpact
+                    {
+                        cpuImprovementPercent = 20, ramImprovementPercent = 10,
+                        gpuMeasured = true, gpuImprovementPercent = 50, confidence = "high"
+                    },
+                    actions = new OptimizationReceipt { processCount = 10 },
+                    persistenceScope = OptimizationWorkflow.PersistenceScope,
+                    tpuStatus = OptimizationWorkflow.TpuStatus,
+                    receiptPath = @"C:\Temp\receipt.json",
+                    errors = new List<string>()
+                });
+                bool rendered = RenderForContract(form,
+                    Path.Combine(Path.GetTempPath(), "pspl-optimizer-progress.png"));
+                return monotonic && form._progress.Value == 100 &&
+                       form._close.Enabled &&
+                       rendered &&
+                       form._details.Text.Contains("CPU") &&
+                       form._details.Text.Contains("50.0% -> 40.0%") &&
+                       form._details.Text.Contains("Windows startup: off") &&
+                       form._details.Text.Contains("does not fabricate");
+            }
+        }
+    }
+
     // ---------------------------------------------------------------------
     //  Details form
     // ---------------------------------------------------------------------
@@ -4202,6 +5241,8 @@ namespace PSPL
         private string[] _searchTokens = new string[0];
         private int _filteredApplicationCount;
         private int _totalApplicationCount;
+        private bool _optimizationRunning;
+        private string _lastOptimizationSummary = "";
 
         private enum SortKey { Cpu, Ram, Gpu, Name, Pid, Vram, Priority }
         private SortKey _sort = SortKey.Cpu;
@@ -4722,7 +5763,8 @@ namespace PSPL
             var tips = new ToolTip();
             tips.SetToolTip(_txtSearch, "Filter by application, PID, executable path, priority or controls");
             tips.SetToolTip(_btnClearSearch, "Clear search");
-            tips.SetToolTip(_btnOptimize, "Apply the reversible safe background-process profile");
+            tips.SetToolTip(_btnOptimize,
+                "Measure baseline, apply safe reversible changes, then report CPU/RAM/GPU impact");
             tips.SetToolTip(_chkGroupApps,
                 "Off shows one independently measured PID per row; on combines related processes");
 
@@ -5032,23 +6074,71 @@ namespace PSPL
 
         private void RunSafeOptimizationFromUi()
         {
+            if (_optimizationRunning) return;
             string message =
-                "Review every observed process and apply only reversible Below Normal " +
-                "priority changes to recognized noninteractive background workers?\n\n" +
-                "Critical Windows processes, visible apps, AI-session infrastructure, " +
-                "and existing user or Process Lasso rules are preserved.";
-            if (new DarkBox("Safe optimization", message, true).ShowDialog(this) !=
+                "Measure a stable baseline, review every observed process, remove the older " +
+                "conflicting app-owned boost policy, and apply only reversible safe changes?\n\n" +
+                "No process will be closed. RAM will not be force-trimmed, GPU will not be " +
+                "suspended, and critical, visible, AI, and externally managed processes stay protected.";
+            if (new DarkBox("Measured safe optimization", message, true).ShowDialog(this) !=
                 DialogResult.Yes) return;
-            OptimizationReceipt receipt = SafeOptimizer.Execute(_sampler.Snap, "apply");
+
+            _optimizationRunning = true;
+            _btnOptimize.Enabled = false;
+            _btnOptimize.Text = "WORKING...";
+            OptimizationRunReceipt result = null;
+            Exception failure = null;
+            using (var progress = new OptimizationProgressForm())
+            {
+                progress.Shown += (s, e) =>
+                {
+                    var worker = new Thread(delegate()
+                    {
+                        try
+                        {
+                            result = OptimizationWorkflow.Run(
+                                _sampler, progress.UpdateProgress);
+                            progress.Complete(result);
+                        }
+                        catch (Exception ex)
+                        {
+                            failure = ex;
+                            progress.Fail(ex);
+                        }
+                    });
+                    worker.IsBackground = true;
+                    worker.Priority = ThreadPriority.AboveNormal;
+                    worker.Start();
+                };
+                progress.ShowDialog(this);
+            }
+
+            _optimizationRunning = false;
+            _btnOptimize.Enabled = true;
+            _btnOptimize.Text = "OPTIMIZE";
             _sampler.Rules = RulesStore.Load();
-            _lblStatus.Text = "Optimization reviewed " + receipt.processCount +
-                " processes: changed " + receipt.changedProcesses +
-                ", persistent rules " + receipt.persistentRules +
-                ", failures " + receipt.failedChanges + ".";
-            _tray.ShowBalloonTip(2200, "PSProcLasso",
-                "Safe optimization reviewed " + receipt.processCount +
-                " processes and changed " + receipt.changedProcesses + ".",
-                receipt.failedChanges == 0 ? ToolTipIcon.Info : ToolTipIcon.Warning);
+            if (result != null && result.systemImpact != null)
+            {
+                string gpu = result.systemImpact.gpuMeasured
+                    ? ", GPU " + OptimizationWorkflow.FormatSignedChange(
+                        result.systemImpact.gpuImprovementPercent)
+                    : ", GPU not comparable";
+                _lastOptimizationSummary =
+                    "Measured: CPU " + OptimizationWorkflow.FormatSignedChange(
+                        result.systemImpact.cpuImprovementPercent) +
+                    ", RAM " + OptimizationWorkflow.FormatSignedChange(
+                        result.systemImpact.ramImprovementPercent) + gpu +
+                    " (" + result.systemImpact.confidence + " confidence)";
+                _tray.ShowBalloonTip(3500, "PSProcLasso",
+                    _lastOptimizationSummary,
+                    result.errors == null || result.errors.Count == 0
+                        ? ToolTipIcon.Info : ToolTipIcon.Warning);
+            }
+            else if (failure != null)
+            {
+                _lastOptimizationSummary =
+                    "Optimization stopped safely: " + failure.Message;
+            }
             RefreshAll();
         }
 
@@ -5124,7 +6214,10 @@ namespace PSPL
                     (_sortAsc ? "  LOWEST FIRST ▲" : "  HIGHEST FIRST ▼") +
                     "   View: " + (_groupApplications ? "APPLICATIONS" : "PROCESSES") +
                     (gpuFresh ? "   GPU age " + _sampler.GpuDataAgeMs + " ms" : "") +
-                    filterTxt + errTxt;
+                    filterTxt +
+                    (String.IsNullOrWhiteSpace(_lastOptimizationSummary)
+                        ? "" : "   " + _lastOptimizationSummary) +
+                    errTxt;
             }
             catch { }
         }
@@ -6018,8 +7111,8 @@ namespace PSPL
                       "  Ctrl+A / SELECT ALL      → select every visible process\n" +
                       "  Ctrl+F / SEARCH          → filter by app, PID, path, priority or controls\n" +
                       "  Esc                      → clear the active search instantly\n" +
-                      "  OPTIMIZE                 → review every PID and safely lower only recognized\n" +
-                      "                             noninteractive background workers (reversible)\n" +
+                      "  OPTIMIZE                 → measure baseline, review every PID, apply only safe\n" +
+                      "                             reversible changes, then show measured CPU/RAM/GPU results\n" +
                       "  Right-click a row        → priority, affinity, CPU/GPU/RAM limits,\n" +
                       "                             watchdog, kill (applies to every member process)\n" +
                       "  Keys: 1 = CPU  2 = RAM  3 = GPU   F5 = refresh now   Del = kill\n" +
@@ -6030,7 +7123,8 @@ namespace PSPL
                       "\n" +
                 "Live meters: CPU / RAM update twice a second; GPU updates about once a second.\n" +
                       "Rules are saved to %USERPROFILE%\\.psproclasso\\rules.json and shared\n" +
-                      "with the PSProcLasso PowerShell TUI.\n" +
+                      "with the PSProcLasso PowerShell TUI. Optimization evidence is saved to\n" +
+                      "%USERPROFILE%\\.psproclasso\\last-optimization.json.\n" +
                       "AI automation: --ai-snapshot, --optimize-plan, --optimize-apply and\n" +
                       "--optimize-restore write stable JSON receipts to a requested path.\n" +
                       "\n" +
@@ -7926,6 +9020,8 @@ namespace PSPL
                 bool processIdentitySafety = Sampler.VerifyProcessIdentitySafetyContract();
                 bool nativeStatusSafety = Sampler.VerifyNativeStatusSafetyContract();
                 bool resourceReleaseSafety = Sampler.VerifyResourceReleaseSafetyContract();
+                bool legacyBoostIsolationSafety =
+                    Sampler.VerifyLegacyBoostIsolationContract();
                 bool startupPrivilegeSafety = StartupManager.VerifyLeastPrivilegeContract();
                 bool startupDisabledStateSafety = StartupManager.VerifyDisabledStateContract();
                 bool concurrentRuleSafety = RulesStore.VerifyConcurrentMutationContract();
@@ -7938,6 +9034,8 @@ namespace PSPL
                 bool calmRefreshCadenceSafety =
                     MainForm.VerifyCalmRefreshCadenceContract();
                 bool optimizerPolicySafety = SafeOptimizer.VerifyPolicyContract();
+                bool optimizerWorkflowSafety = OptimizationWorkflow.VerifyContract();
+                bool optimizerProgressUiSafety = OptimizationProgressForm.VerifyContract();
                 bool adaptiveTop20Safety = SafeOptimizer.VerifyAdaptiveTop20Contract();
                 bool aiAutomationSafety = AiAutomation.VerifyJsonContract();
                 bool monitorPrioritySafety = VerifyMonitorPriorityContract();
@@ -7951,6 +9049,7 @@ namespace PSPL
                 log.AppendLine("process identity safety=" + processIdentitySafety);
                 log.AppendLine("native suspend/resume status safety=" + nativeStatusSafety);
                 log.AppendLine("resource release safety=" + resourceReleaseSafety);
+                log.AppendLine("legacy boost isolation=" + legacyBoostIsolationSafety);
                 log.AppendLine("startup least-privilege safety=" + startupPrivilegeSafety);
                 log.AppendLine("startup disabled-state safety=" + startupDisabledStateSafety);
                 log.AppendLine("concurrent rule mutation safety=" + concurrentRuleSafety);
@@ -7963,6 +9062,8 @@ namespace PSPL
                 log.AppendLine("calm visible refresh cadence=" +
                                calmRefreshCadenceSafety);
                 log.AppendLine("safe optimizer policy=" + optimizerPolicySafety);
+                log.AppendLine("measured optimizer workflow=" + optimizerWorkflowSafety);
+                log.AppendLine("optimizer progress UI=" + optimizerProgressUiSafety);
                 log.AppendLine("adaptive top-20 performance policy=" + adaptiveTop20Safety);
                 log.AppendLine("AI automation JSON contract=" + aiAutomationSafety);
                 log.AppendLine("monitor responsiveness priority=" + monitorPrioritySafety);
@@ -8021,11 +9122,14 @@ namespace PSPL
                                 cpuReadFailureRecovery && gpuCounterFailureIsolation && gpuWarmupSafety &&
                                 gpuFreshnessSafety
                                  && processIdentitySafety && nativeStatusSafety && resourceReleaseSafety
+                                 && legacyBoostIsolationSafety
                                  && startupPrivilegeSafety && startupDisabledStateSafety &&
                                  concurrentRuleSafety && backupRuleSafety
                                 && recoveryBudgetSafety && searchFilterSafety && processViewSafety &&
                                 unavailableGpuRenderingSafety && calmRefreshCadenceSafety &&
-                                optimizerPolicySafety && adaptiveTop20Safety &&
+                                optimizerPolicySafety && optimizerWorkflowSafety &&
+                                optimizerProgressUiSafety &&
+                                adaptiveTop20Safety &&
                                 aiAutomationSafety &&
                                 monitorPrioritySafety && diagnosticInstanceScopeSafety
                     ? "RESULT: OK - warmed CPU/RAM/GPU sampling with zero exceptions."

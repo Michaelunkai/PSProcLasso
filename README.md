@@ -92,23 +92,25 @@ What you get:
   combination of process/application name, PID, executable path, priority, affinity, or
   active control. Tokens are matched together against the current view. Press
   `Esc` or the clear button to restore the complete live table immediately.
-* **Safe whole-system optimization** — the **OPTIMIZE** button reviews every observed PID
-  and records an explicit decision. It never terminates a process, never applies High or
-  Realtime priority, preserves Windows-critical and Session 0 processes, visible/foreground
-  applications, AI-session infrastructure, and existing user or Process Lasso priority
-  rules. Only recognized noninteractive background workers at default priority can be
-  moved to Below Normal. Optimizer-owned persistent rules are marked, reversible, and
-  preserve unrelated CPU/RAM/GPU/watchdog settings.
-* **Adaptive top-20 performance mode** — while enforcement is active, the monitor
-  continuously takes the union of the 20 heaviest applications by CPU, RAM, and GPU.
-  A five-minute rolling window keeps bursty heavy applications optimized instead of
-  dropping them because of a single quiet sample, while stale selections expire.
-  For every member process it removes PSProcLasso CPU/GPU/RAM caps, restores all-core
-  affinity, disables Windows execution-speed throttling where the OS permits it, and
-  keeps safe user workloads at Above Normal priority. Kernel, Session 0, and protected
-  or self-managed application scheduling stays under Windows/application control. The
-  selected application rules are persisted at a calm 30-second cadence with reversible
-  original settings, so new instances receive the same performance policy immediately.
+* **Measured whole-system optimization** — the **OPTIMIZE** button first collects a
+  stable six-second CPU/RAM/GPU baseline, reviews every observed PID, applies only
+  conservative reversible scheduling changes, waits for the system to settle, and then
+  measures another six-second window. A calm progress dialog shows every phase and ends
+  with separate signed CPU, RAM, and GPU before/after percentages. Increased load is
+  reported as increased; unavailable GPU data is not converted to a fake zero. The full
+  per-application evidence is saved to
+  `%USERPROFILE%\.psproclasso\last-optimization.json`.
+* The optimizer never terminates a process, never force-trims RAM, never duty-cycles GPU,
+  never applies High or Realtime priority, and never restricts affinity. Windows-critical
+  and Session 0 processes, visible/foreground applications, AI-session infrastructure,
+  and existing user or Process Lasso rules are preserved. Only recognized noninteractive
+  background workers at default priority can move to Below Normal. Optimizer-owned rules
+  are marked, reversible, and preserve unrelated CPU/RAM/GPU/watchdog settings.
+* The former continuously applied adaptive top-20 boost is disabled in the normal GUI
+  because it could fight the safe optimizer and increase system load. Its explicit
+  `--top20-plan` / `--top20-apply` diagnostic commands remain available for deliberate
+  opt-in testing; saved legacy top-20 rules are ignored on normal launch and reconciled
+  when measured optimization runs.
 * The lightweight monitor process corrects inherited Idle, Below Normal, or Normal
   launcher priority to **Above Normal**, keeping sampling and the UI responsive under
   heavy load. It never promotes itself to Realtime, and inherited High stays High.
@@ -136,6 +138,8 @@ What you get:
   terminal window, applies saved rules to every matching process instance, and ignores
   duplicate launches while allowing a normal launch to reveal the existing window.
   Least privilege prevents user-writable rules or binaries from becoming an elevation path.
+  With startup off, optimizer rules remain saved and are re-applied whenever PSProcLasso
+  is manually running; the optimizer does not silently re-enable startup.
 * Persistent rules shared with the TUI. Concurrent GUI/background updates are serialized,
   writes are atomic, and a last-known-good backup repairs a missing or corrupt primary
   rules file without losing independent rule changes.
@@ -167,10 +171,10 @@ Sanity checks (all headless, all print `RESULT: OK` with zero exceptions):
 | `--report [path]` | **all eight reports in one run** — includes independent accuracy, sampling cadence, startup, UI paint, enforcement, and recovery checks, then writes a consolidated verdict (`ALL REPORTS PASSED` / `FAIL`); defaults to `%TEMP%\pspl-gui-report.txt`, or pass your own path |
 | `--ai-snapshot [path]` | writes `psproclasso.snapshot.v1` JSON with live system totals and grouped application metrics; defaults to `%TEMP%\psproclasso-snapshot.json` |
 | `--optimize-plan [path]` | dry-run classification for every observed PID; writes `psproclasso.optimization.v1` JSON and changes nothing |
-| `--optimize-apply [path]` | applies only the safe plan, atomically merges optimizer-owned persistent rules, and writes a per-PID receipt |
+| `--optimize-apply [path]` | waits for live CPU/RAM/GPU telemetry, reconciles the former conflicting app-owned boost policy, applies only the safe plan, atomically merges optimizer-owned persistent rules, and writes a per-PID receipt |
 | `--optimize-restore [path]` | restores priorities owned by the optimizer without removing unrelated user limits or rules |
 | `--top20-plan [path]` | measures the live top 20 CPU, RAM, and GPU applications and writes a no-change `psproclasso.top20-performance.v1` plan |
-| `--top20-apply [path]` | applies the measured adaptive performance policy, removes managed limits, and writes a per-PID JSON receipt |
+| `--top20-apply [path]` | explicit opt-in legacy performance experiment: applies the measured adaptive policy, removes managed limits, and writes a per-PID JSON receipt |
 | `--enforcementcheck` | disposable child-process proof of hard CPU/RAM assignment, GPU duty cycling, saved-rule persistence, removal, and resume |
 | `--backgroundguardcheck` | hidden crash-recovery proof: kills a disposable background instance, verifies its companion relaunches it invisibly, then verifies a clean exit stays stopped |
 
